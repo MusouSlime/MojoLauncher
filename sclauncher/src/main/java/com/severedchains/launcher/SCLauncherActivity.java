@@ -100,16 +100,20 @@ public class SCLauncherActivity extends AppCompatActivity {
     private Button snapdragonButton;
     private Button maliButton;
     private Button maliDebugButton;
+    private Button maliFixButton;
     private TextView gpuModeText;
 
     // RG406H comparison test: Snapdragon = stock shaders, Mali-A = patched
     // tmd.gsh (near-plane cull off), Mali-B = cull-off gsh + tmd.fsh that
     // visualizes the per-triangle flags (green=textured, red=untextured,
-    // blue=translucent). Sticky; auto-defaults by GPU renderer
+    // blue=translucent), Mali-C = Mali-B with the emit() helper unrolled
+    // (constant GS input indices only — no dynamic vs_out[i]/gl_in[i]).
+    // Sticky; auto-defaults by GPU renderer
     // (Adreno -> Snapdragon, Mali/unknown -> Mali-A).
     public static final String GPU_MODE_SNAPDRAGON = "snapdragon";
     public static final String GPU_MODE_MALI = "mali";
     public static final String GPU_MODE_MALIB = "malib";
+    public static final String GPU_MODE_MALIC = "malic";
     private static final String PREFS_NAME = "sclauncher_prefs";
     private static final String PREF_GPU_MODE = "gpu_mode";
     private String mGpuMode = GPU_MODE_SNAPDRAGON;
@@ -181,6 +185,7 @@ public class SCLauncherActivity extends AppCompatActivity {
         snapdragonButton = findViewById(R.id.snapdragonButton);
         maliButton = findViewById(R.id.maliButton);
         maliDebugButton = findViewById(R.id.maliDebugButton);
+        maliFixButton = findViewById(R.id.maliFixButton);
         gpuModeText = findViewById(R.id.gpuModeText);
         if (snapdragonButton != null) {
             snapdragonButton.setOnClickListener(v -> setGpuMode(GPU_MODE_SNAPDRAGON));
@@ -190,6 +195,9 @@ public class SCLauncherActivity extends AppCompatActivity {
         }
         if (maliDebugButton != null) {
             maliDebugButton.setOnClickListener(v -> setGpuMode(GPU_MODE_MALIB));
+        }
+        if (maliFixButton != null) {
+            maliFixButton.setOnClickListener(v -> setGpuMode(GPU_MODE_MALIC));
         }
 
         importJreButton.setOnClickListener(v -> importJreFromStorage());
@@ -503,7 +511,8 @@ public class SCLauncherActivity extends AppCompatActivity {
 
     // ------------------------------------------------------------------
     // GPU comparison mode (RG406H test): Snapdragon runs stock shaders,
-    // Mali swaps in the cull-off tmd.gsh. The variants live in the tiny
+    // Mali-A swaps in the cull-off tmd.gsh, Mali-B adds the flag-debug
+    // tmd.fsh, Mali-C keeps both with an unrolled emit (no dynamic index). The variants live in the tiny
     // gameDir/gpu_variants/ dir (own marker, no game-bundle wipe); the
     // selected tmd.gsh is copied over gameDir/gfx/shaders/ before launch.
     // ------------------------------------------------------------------
@@ -513,7 +522,7 @@ public class SCLauncherActivity extends AppCompatActivity {
                     getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
             String saved = p.getString(PREF_GPU_MODE, null);
             if (GPU_MODE_MALI.equals(saved) || GPU_MODE_SNAPDRAGON.equals(saved)
-                    || GPU_MODE_MALIB.equals(saved)) {
+                    || GPU_MODE_MALIB.equals(saved) || GPU_MODE_MALIC.equals(saved)) {
                 LogFile.log("GPU mode (saved): " + saved);
                 return saved;
             }
@@ -554,7 +563,9 @@ public class SCLauncherActivity extends AppCompatActivity {
 
     private void updateGpuModeUI() {
         if (gpuModeText != null) {
-            gpuModeText.setText(GPU_MODE_MALIB.equals(mGpuMode)
+            gpuModeText.setText(GPU_MODE_MALIC.equals(mGpuMode)
+                    ? "GPU: Mali-C (unrolled emit)"
+                    : GPU_MODE_MALIB.equals(mGpuMode)
                     ? "GPU: Mali-B (flag debug)"
                     : GPU_MODE_MALI.equals(mGpuMode)
                     ? "GPU: Mali-A (cull-off fix)"
@@ -566,6 +577,9 @@ public class SCLauncherActivity extends AppCompatActivity {
         if (maliDebugButton != null) {
             maliDebugButton.setText(GPU_MODE_MALIB.equals(mGpuMode) ? "Mali-B dbg ✓" : "Mali-B dbg");
         }
+        if (maliFixButton != null) {
+            maliFixButton.setText(GPU_MODE_MALIC.equals(mGpuMode) ? "Mali-C ✓" : "Mali-C");
+        }
         if (snapdragonButton != null) {
             snapdragonButton.setText(GPU_MODE_SNAPDRAGON.equals(mGpuMode) ? "Snap ✓" : "Snap");
         }
@@ -575,16 +589,18 @@ public class SCLauncherActivity extends AppCompatActivity {
     private void extractGpuVariants() {
         try {
             File variantsDir = new File(gameDir, "gpu_variants");
-            File marker = new File(variantsDir, ".gpu_variant_v2");
+            File marker = new File(variantsDir, ".gpu_variant_v3");
             if (marker.exists()
                     && new File(variantsDir, "mali/tmd.gsh").exists()
                     && new File(variantsDir, "malib/tmd.gsh").exists()
                     && new File(variantsDir, "malib/tmd.fsh").exists()
+                    && new File(variantsDir, "malic/tmd.gsh").exists()
+                    && new File(variantsDir, "malic/tmd.fsh").exists()
                     && new File(variantsDir, "stock/tmd.gsh").exists()
                     && new File(variantsDir, "stock/tmd.fsh").exists()) {
                 return;
             }
-            // v1 -> v2: added malib (flag-debug fsh). All variants ship
+            // v2 -> v3: added malic (unrolled-emit gsh + flag-debug fsh). All variants ship
             // IN the APK (stock/ = pristine bytes), so a stale dir is
             // simply wiped — never snapshotted from gameDir (which may
             // already hold a Mali file from a previous run).
@@ -606,20 +622,23 @@ public class SCLauncherActivity extends AppCompatActivity {
     private void applyGpuShaderVariant() {
         if (gameDir == null) return;
         try {
-            String variant = GPU_MODE_MALIB.equals(mGpuMode) ? "malib"
+            String variant = GPU_MODE_MALIC.equals(mGpuMode) ? "malic"
+                    : GPU_MODE_MALIB.equals(mGpuMode) ? "malib"
                     : GPU_MODE_MALI.equals(mGpuMode) ? "mali" : "stock";
             File gshSrc = new File(gameDir, "gpu_variants/" + variant + "/tmd.gsh");
             File fshSrc = new File(gameDir, "gpu_variants/" + variant + "/tmd.fsh");
             File gshDst = new File(gameDir, "gfx/shaders/tmd.gsh");
             File fshDst = new File(gameDir, "gfx/shaders/tmd.fsh");
-            // Stock/mali variants ship only tmd.gsh; malib adds tmd.fsh.
+            // Stock/mali variants ship only tmd.gsh; malib AND malic add the
+            // flag-debug tmd.fsh (identical logic — only the gsh differs, so
+            // Mali-B vs Mali-C isolates the emit unroll).
             // A missing file means "keep current" (e.g. v1 installs).
             if (gshSrc.exists()) {
                 copyFile(gshSrc, gshDst);
             }
-            // Mali-B debug replaces the fragment shader; every other mode
-            // restores stock fsh (a previous Mali-B run overwrote it).
-            if (GPU_MODE_MALIB.equals(mGpuMode)) {
+            // Debug modes replace the fragment shader; every other mode
+            // restores stock fsh (a previous debug run overwrote it).
+            if (GPU_MODE_MALIB.equals(mGpuMode) || GPU_MODE_MALIC.equals(mGpuMode)) {
                 if (fshSrc.exists()) copyFile(fshSrc, fshDst);
             } else {
                 File stockFsh = new File(gameDir, "gpu_variants/stock/tmd.fsh");

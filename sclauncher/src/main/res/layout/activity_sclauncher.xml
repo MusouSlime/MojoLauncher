@@ -101,7 +101,7 @@
                 android:layout_height="wrap_content"
                 android:orientation="horizontal"
                 android:gravity="center"
-                android:layout_marginBottom="8dp">
+                android:layout_marginBottom="4dp">
 
                 <Button
                     android:id="@+id/snapdragonButton"
@@ -120,14 +120,32 @@
                     android:text="Mali-A"
                     android:textSize="14sp"
                     android:paddingHorizontal="16dp"
-                    android:paddingVertical="12dp"
-                    android:layout_marginEnd="6dp" />
+                    android:paddingVertical="12dp" />
+
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center"
+                android:layout_marginBottom="8dp">
 
                 <Button
                     android:id="@+id/maliDebugButton"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="Mali-B dbg"
+                    android:textSize="14sp"
+                    android:paddingHorizontal="16dp"
+                    android:paddingVertical="12dp"
+                    android:layout_marginEnd="6dp" />
+
+                <Button
+                    android:id="@+id/maliFixButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Mali-C"
                     android:textSize="14sp"
                     android:paddingHorizontal="16dp"
                     android:paddingVertical="12dp" />
