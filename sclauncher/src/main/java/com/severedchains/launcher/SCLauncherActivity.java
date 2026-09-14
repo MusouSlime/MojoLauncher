@@ -99,13 +99,17 @@ public class SCLauncherActivity extends AppCompatActivity {
     private Button importSavesButton;
     private Button snapdragonButton;
     private Button maliButton;
+    private Button maliDebugButton;
     private TextView gpuModeText;
 
-    // RG406H comparison test: Snapdragon = stock shaders, Mali = patched
-    // tmd.gsh (near-plane cull off). Sticky; auto-defaults by GPU renderer
-    // (Adreno -> Snapdragon, Mali/unknown -> Mali).
+    // RG406H comparison test: Snapdragon = stock shaders, Mali-A = patched
+    // tmd.gsh (near-plane cull off), Mali-B = cull-off gsh + tmd.fsh that
+    // visualizes the per-triangle flags (green=textured, red=untextured,
+    // blue=translucent). Sticky; auto-defaults by GPU renderer
+    // (Adreno -> Snapdragon, Mali/unknown -> Mali-A).
     public static final String GPU_MODE_SNAPDRAGON = "snapdragon";
     public static final String GPU_MODE_MALI = "mali";
+    public static final String GPU_MODE_MALIB = "malib";
     private static final String PREFS_NAME = "sclauncher_prefs";
     private static final String PREF_GPU_MODE = "gpu_mode";
     private String mGpuMode = GPU_MODE_SNAPDRAGON;
@@ -176,12 +180,16 @@ public class SCLauncherActivity extends AppCompatActivity {
         importSavesButton = findViewById(R.id.importSavesButton);
         snapdragonButton = findViewById(R.id.snapdragonButton);
         maliButton = findViewById(R.id.maliButton);
+        maliDebugButton = findViewById(R.id.maliDebugButton);
         gpuModeText = findViewById(R.id.gpuModeText);
         if (snapdragonButton != null) {
             snapdragonButton.setOnClickListener(v -> setGpuMode(GPU_MODE_SNAPDRAGON));
         }
         if (maliButton != null) {
             maliButton.setOnClickListener(v -> setGpuMode(GPU_MODE_MALI));
+        }
+        if (maliDebugButton != null) {
+            maliDebugButton.setOnClickListener(v -> setGpuMode(GPU_MODE_MALIB));
         }
 
         importJreButton.setOnClickListener(v -> importJreFromStorage());
@@ -504,7 +512,8 @@ public class SCLauncherActivity extends AppCompatActivity {
             android.content.SharedPreferences p =
                     getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
             String saved = p.getString(PREF_GPU_MODE, null);
-            if (GPU_MODE_MALI.equals(saved) || GPU_MODE_SNAPDRAGON.equals(saved)) {
+            if (GPU_MODE_MALI.equals(saved) || GPU_MODE_SNAPDRAGON.equals(saved)
+                    || GPU_MODE_MALIB.equals(saved)) {
                 LogFile.log("GPU mode (saved): " + saved);
                 return saved;
             }
@@ -544,39 +553,44 @@ public class SCLauncherActivity extends AppCompatActivity {
     }
 
     private void updateGpuModeUI() {
-        boolean mali = GPU_MODE_MALI.equals(mGpuMode);
         if (gpuModeText != null) {
-            gpuModeText.setText(mali
-                    ? "GPU: Mali (cull-off fix)"
+            gpuModeText.setText(GPU_MODE_MALIB.equals(mGpuMode)
+                    ? "GPU: Mali-B (flag debug)"
+                    : GPU_MODE_MALI.equals(mGpuMode)
+                    ? "GPU: Mali-A (cull-off fix)"
                     : "GPU: Snapdragon (stock shaders)");
         }
         if (maliButton != null) {
-            maliButton.setText(mali ? "Mali (fix) ✓" : "Mali (fix)");
+            maliButton.setText(GPU_MODE_MALI.equals(mGpuMode) ? "Mali-A ✓" : "Mali-A");
+        }
+        if (maliDebugButton != null) {
+            maliDebugButton.setText(GPU_MODE_MALIB.equals(mGpuMode) ? "Mali-B dbg ✓" : "Mali-B dbg");
         }
         if (snapdragonButton != null) {
-            snapdragonButton.setText(mali ? "Snapdragon" : "Snapdragon ✓");
+            snapdragonButton.setText(GPU_MODE_SNAPDRAGON.equals(mGpuMode) ? "Snap ✓" : "Snap");
         }
     }
 
-    /** Extracts the shader-variant dir once (stock + mali tmd.gsh). */
+    /** Extracts the shader-variant dir once (stock + mali/malib files). */
     private void extractGpuVariants() {
         try {
             File variantsDir = new File(gameDir, "gpu_variants");
-            File marker = new File(variantsDir, ".gpu_variant_v1");
+            File marker = new File(variantsDir, ".gpu_variant_v2");
             if (marker.exists()
                     && new File(variantsDir, "mali/tmd.gsh").exists()
-                    && new File(variantsDir, "stock/tmd.gsh").exists()) {
+                    && new File(variantsDir, "malib/tmd.gsh").exists()
+                    && new File(variantsDir, "malib/tmd.fsh").exists()
+                    && new File(variantsDir, "stock/tmd.gsh").exists()
+                    && new File(variantsDir, "stock/tmd.fsh").exists()) {
                 return;
             }
+            // v1 -> v2: added malib (flag-debug fsh). All variants ship
+            // IN the APK (stock/ = pristine bytes), so a stale dir is
+            // simply wiped — never snapshotted from gameDir (which may
+            // already hold a Mali file from a previous run).
+            deleteRecursive(variantsDir);
             variantsDir.mkdirs();
             extractAssetsDir("gpu_variants", variantsDir);
-            // Stock copy: snapshot the bundled game shader so Snapdragon mode
-            // can always restore exact stock bytes (a Mali run overwrites
-            // gameDir/gfx/shaders/tmd.gsh in place).
-            File stockDir = new File(variantsDir, "stock");
-            stockDir.mkdirs();
-            copyFile(new File(gameDir, "gfx/shaders/tmd.gsh"),
-                    new File(stockDir, "tmd.gsh"));
             marker.createNewFile();
             LogFile.log("GPU shader variants extracted to "
                     + variantsDir.getAbsolutePath());
@@ -586,26 +600,34 @@ public class SCLauncherActivity extends AppCompatActivity {
     }
 
     /**
-     * Copies the selected tmd.gsh over gameDir/gfx/shaders/tmd.gsh.
+     * Copies the selected shaders over gameDir/gfx/shaders/.
      * Called on every launch so the mode switch never needs a reinstall.
      */
     private void applyGpuShaderVariant() {
         if (gameDir == null) return;
         try {
-            boolean mali = GPU_MODE_MALI.equals(mGpuMode);
-            File src = mali
-                    ? new File(gameDir, "gpu_variants/mali/tmd.gsh")
-                    : new File(gameDir, "gpu_variants/stock/tmd.gsh");
-            File dst = new File(gameDir, "gfx/shaders/tmd.gsh");
-            if (!src.exists()) {
-                LogFile.log("GPU variant missing (" + src.getName()
-                        + "), keeping current tmd.gsh");
-                return;
+            String variant = GPU_MODE_MALIB.equals(mGpuMode) ? "malib"
+                    : GPU_MODE_MALI.equals(mGpuMode) ? "mali" : "stock";
+            File gshSrc = new File(gameDir, "gpu_variants/" + variant + "/tmd.gsh");
+            File fshSrc = new File(gameDir, "gpu_variants/" + variant + "/tmd.fsh");
+            File gshDst = new File(gameDir, "gfx/shaders/tmd.gsh");
+            File fshDst = new File(gameDir, "gfx/shaders/tmd.fsh");
+            // Stock/mali variants ship only tmd.gsh; malib adds tmd.fsh.
+            // A missing file means "keep current" (e.g. v1 installs).
+            if (gshSrc.exists()) {
+                copyFile(gshSrc, gshDst);
             }
-            copyFile(src, dst);
-            LogFile.log("GPU shaders applied: "
-                    + (mali ? "MALI cull-off" : "SNAPDRAGON stock")
-                    + " tmd.gsh (" + dst.length() + " bytes)");
+            // Mali-B debug replaces the fragment shader; every other mode
+            // restores stock fsh (a previous Mali-B run overwrote it).
+            if (GPU_MODE_MALIB.equals(mGpuMode)) {
+                if (fshSrc.exists()) copyFile(fshSrc, fshDst);
+            } else {
+                File stockFsh = new File(gameDir, "gpu_variants/stock/tmd.fsh");
+                if (stockFsh.exists()) copyFile(stockFsh, fshDst);
+            }
+            LogFile.log("GPU shaders applied: " + mGpuMode.toUpperCase()
+                    + " tmd.gsh (" + gshDst.length() + "b)"
+                    + " tmd.fsh (" + fshDst.length() + "b)");
         } catch (Exception e) {
             LogFile.error("Failed to apply GPU shader variant", e);
         }

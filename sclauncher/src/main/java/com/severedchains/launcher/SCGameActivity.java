@@ -137,8 +137,9 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
                 ? getIntent().getStringExtra(EXTRA_GPU_MODE) : null;
         if (gpuMode == null) gpuMode = "snapdragon";
         SCLogger.appendToLog("GPU mode: " + gpuMode
-                + ("mali".equals(gpuMode)
-                        ? " (cull-off tmd.gsh)" : " (stock shaders)"));
+                + ("malib".equals(gpuMode) ? " (cull-off gsh + flag-debug fsh)"
+                        : "mali".equals(gpuMode) ? " (cull-off tmd.gsh)"
+                        : " (stock shaders)"));
         SCActionTrail.record("Game screen opened [GPU:" + gpuMode + "]");
         // Game output stays in backend files (latestlog.txt); no on-screen log.
         SCLogger.begin(getFilesDir());

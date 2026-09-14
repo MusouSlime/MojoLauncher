@@ -107,9 +107,9 @@
                     android:id="@+id/snapdragonButton"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Snapdragon"
+                    android:text="Snap"
                     android:textSize="14sp"
-                    android:paddingHorizontal="24dp"
+                    android:paddingHorizontal="16dp"
                     android:paddingVertical="12dp"
                     android:layout_marginEnd="6dp" />
 
@@ -117,9 +117,19 @@
                     android:id="@+id/maliButton"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Mali (fix)"
+                    android:text="Mali-A"
                     android:textSize="14sp"
-                    android:paddingHorizontal="24dp"
+                    android:paddingHorizontal="16dp"
+                    android:paddingVertical="12dp"
+                    android:layout_marginEnd="6dp" />
+
+                <Button
+                    android:id="@+id/maliDebugButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Mali-B dbg"
+                    android:textSize="14sp"
+                    android:paddingHorizontal="16dp"
                     android:paddingVertical="12dp" />
 
             </LinearLayout>
