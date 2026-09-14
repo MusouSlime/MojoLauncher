@@ -97,6 +97,18 @@ public class SCLauncherActivity extends AppCompatActivity {
     private Button importJreButton;
     private Button exportSavesButton;
     private Button importSavesButton;
+    private Button snapdragonButton;
+    private Button maliButton;
+    private TextView gpuModeText;
+
+    // RG406H comparison test: Snapdragon = stock shaders, Mali = patched
+    // tmd.gsh (near-plane cull off). Sticky; auto-defaults by GPU renderer
+    // (Adreno -> Snapdragon, Mali/unknown -> Mali).
+    public static final String GPU_MODE_SNAPDRAGON = "snapdragon";
+    public static final String GPU_MODE_MALI = "mali";
+    private static final String PREFS_NAME = "sclauncher_prefs";
+    private static final String PREF_GPU_MODE = "gpu_mode";
+    private String mGpuMode = GPU_MODE_SNAPDRAGON;
 
     private String dirData;
     private String dirCache;
@@ -162,6 +174,15 @@ public class SCLauncherActivity extends AppCompatActivity {
         importJreButton = findViewById(R.id.importJreButton);
         exportSavesButton = findViewById(R.id.exportSavesButton);
         importSavesButton = findViewById(R.id.importSavesButton);
+        snapdragonButton = findViewById(R.id.snapdragonButton);
+        maliButton = findViewById(R.id.maliButton);
+        gpuModeText = findViewById(R.id.gpuModeText);
+        if (snapdragonButton != null) {
+            snapdragonButton.setOnClickListener(v -> setGpuMode(GPU_MODE_SNAPDRAGON));
+        }
+        if (maliButton != null) {
+            maliButton.setOnClickListener(v -> setGpuMode(GPU_MODE_MALI));
+        }
 
         importJreButton.setOnClickListener(v -> importJreFromStorage());
         exportSavesButton.setOnClickListener(v -> exportSaves());
@@ -202,6 +223,11 @@ public class SCLauncherActivity extends AppCompatActivity {
             LogFile.error("Preflight check failed", e);
         }
 
+        // GPU comparison mode: remembered choice wins, otherwise Adreno ->
+        // Snapdragon (stock), Mali/unknown -> Mali (cull-off fix).
+        mGpuMode = loadGpuMode();
+        updateGpuModeUI();
+
         // Extract bundled game files on first run
         extractBundledGameFiles();
 
@@ -238,6 +264,8 @@ public class SCLauncherActivity extends AppCompatActivity {
         if (markerV4.exists()) {
             LogFile.log("Bundled game files already extracted (v4)");
             extractSclauncherNatives();
+            extractGpuVariants();
+            applyGpuShaderVariant();
             refreshAll();
             return;
         }
@@ -268,6 +296,8 @@ public class SCLauncherActivity extends AppCompatActivity {
                     markerV4.createNewFile();
                     LogFile.log("Bundled game files extracted to " + gameDir.getAbsolutePath());
                     extractSclauncherNatives();
+                    extractGpuVariants();
+                    applyGpuShaderVariant();
                     uiHandler.post(new Runnable() {
                         @Override
                         public void run() {
@@ -460,6 +490,135 @@ public class SCLauncherActivity extends AppCompatActivity {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == PERMISSION_REQUEST_CODE) {
             refreshAll();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // GPU comparison mode (RG406H test): Snapdragon runs stock shaders,
+    // Mali swaps in the cull-off tmd.gsh. The variants live in the tiny
+    // gameDir/gpu_variants/ dir (own marker, no game-bundle wipe); the
+    // selected tmd.gsh is copied over gameDir/gfx/shaders/ before launch.
+    // ------------------------------------------------------------------
+    private String loadGpuMode() {
+        try {
+            android.content.SharedPreferences p =
+                    getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            String saved = p.getString(PREF_GPU_MODE, null);
+            if (GPU_MODE_MALI.equals(saved) || GPU_MODE_SNAPDRAGON.equals(saved)) {
+                LogFile.log("GPU mode (saved): " + saved);
+                return saved;
+            }
+        } catch (Exception ignored) {}
+        String auto = detectGpuMode();
+        LogFile.log("GPU mode (auto by renderer): " + auto);
+        try {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit().putString(PREF_GPU_MODE, auto).apply();
+        } catch (Exception ignored) {}
+        return auto;
+    }
+
+    /** Adreno -> Snapdragon; Mali or anything unknown -> Mali (fix). */
+    private String detectGpuMode() {
+        try {
+            String summary = SCGpuInfo.summary();
+            if (summary != null) {
+                String low = summary.toLowerCase(java.util.Locale.US);
+                if (low.contains("adreno")) return GPU_MODE_SNAPDRAGON;
+                if (low.contains("mali")) return GPU_MODE_MALI;
+            }
+        } catch (Exception ignored) {}
+        return GPU_MODE_MALI;
+    }
+
+    private void setGpuMode(String mode) {
+        mGpuMode = mode;
+        try {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit().putString(PREF_GPU_MODE, mode).apply();
+        } catch (Exception ignored) {}
+        LogFile.log("GPU mode selected: " + mode);
+        SCActionTrail.record("GPU mode selected: " + mode);
+        updateGpuModeUI();
+        applyGpuShaderVariant();
+    }
+
+    private void updateGpuModeUI() {
+        boolean mali = GPU_MODE_MALI.equals(mGpuMode);
+        if (gpuModeText != null) {
+            gpuModeText.setText(mali
+                    ? "GPU: Mali (cull-off fix)"
+                    : "GPU: Snapdragon (stock shaders)");
+        }
+        if (maliButton != null) {
+            maliButton.setText(mali ? "Mali (fix) ✓" : "Mali (fix)");
+        }
+        if (snapdragonButton != null) {
+            snapdragonButton.setText(mali ? "Snapdragon" : "Snapdragon ✓");
+        }
+    }
+
+    /** Extracts the shader-variant dir once (stock + mali tmd.gsh). */
+    private void extractGpuVariants() {
+        try {
+            File variantsDir = new File(gameDir, "gpu_variants");
+            File marker = new File(variantsDir, ".gpu_variant_v1");
+            if (marker.exists()
+                    && new File(variantsDir, "mali/tmd.gsh").exists()
+                    && new File(variantsDir, "stock/tmd.gsh").exists()) {
+                return;
+            }
+            variantsDir.mkdirs();
+            extractAssetsDir("gpu_variants", variantsDir);
+            // Stock copy: snapshot the bundled game shader so Snapdragon mode
+            // can always restore exact stock bytes (a Mali run overwrites
+            // gameDir/gfx/shaders/tmd.gsh in place).
+            File stockDir = new File(variantsDir, "stock");
+            stockDir.mkdirs();
+            copyFile(new File(gameDir, "gfx/shaders/tmd.gsh"),
+                    new File(stockDir, "tmd.gsh"));
+            marker.createNewFile();
+            LogFile.log("GPU shader variants extracted to "
+                    + variantsDir.getAbsolutePath());
+        } catch (Exception e) {
+            LogFile.error("Failed to extract GPU shader variants", e);
+        }
+    }
+
+    /**
+     * Copies the selected tmd.gsh over gameDir/gfx/shaders/tmd.gsh.
+     * Called on every launch so the mode switch never needs a reinstall.
+     */
+    private void applyGpuShaderVariant() {
+        if (gameDir == null) return;
+        try {
+            boolean mali = GPU_MODE_MALI.equals(mGpuMode);
+            File src = mali
+                    ? new File(gameDir, "gpu_variants/mali/tmd.gsh")
+                    : new File(gameDir, "gpu_variants/stock/tmd.gsh");
+            File dst = new File(gameDir, "gfx/shaders/tmd.gsh");
+            if (!src.exists()) {
+                LogFile.log("GPU variant missing (" + src.getName()
+                        + "), keeping current tmd.gsh");
+                return;
+            }
+            copyFile(src, dst);
+            LogFile.log("GPU shaders applied: "
+                    + (mali ? "MALI cull-off" : "SNAPDRAGON stock")
+                    + " tmd.gsh (" + dst.length() + " bytes)");
+        } catch (Exception e) {
+            LogFile.error("Failed to apply GPU shader variant", e);
+        }
+    }
+
+    private static void copyFile(File src, File dst) throws IOException {
+        File parent = dst.getParentFile();
+        if (parent != null) parent.mkdirs();
+        try (FileInputStream in = new FileInputStream(src);
+             FileOutputStream out = new FileOutputStream(dst)) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
         }
     }
 
@@ -713,7 +872,11 @@ public class SCLauncherActivity extends AppCompatActivity {
         launchButton.setEnabled(false);
         searchAgainButton.setEnabled(false);
         progressBar.setVisibility(View.VISIBLE);
-        statusText.setText("Starting game display with " + foundJreName + "...");
+        // Swap the selected shader variant in before the JVM starts — the
+        // game transpiles gfx/shaders/ at load, so this takes effect now.
+        applyGpuShaderVariant();
+        statusText.setText("Starting game display with " + foundJreName
+                + " [" + mGpuMode + "]...");
 
         try {
             List<String> vmArgs = buildVmArgs(foundJreName);
@@ -732,9 +895,10 @@ public class SCLauncherActivity extends AppCompatActivity {
             appArgs.add("-Xmx2G");
             appArgs.add("-ea");
 
-            LogFile.log("Launching SCGameActivity with runtime: " + foundJreName);
+            LogFile.log("Launching SCGameActivity with runtime: " + foundJreName
+                    + " [GPU:" + mGpuMode + "]");
             SCActionTrail.record("Launch game (" + foundJreName + ", "
-                    + cpStrings.size() + " classpath entries)");
+                    + cpStrings.size() + " classpath entries, GPU:" + mGpuMode + ")");
             Intent intent = new Intent(this, SCGameActivity.class);
             intent.putExtra(SCGameActivity.EXTRA_RUNTIME, foundJreName);
             intent.putStringArrayListExtra(SCGameActivity.EXTRA_VMARGS, new ArrayList<>(vmArgs));
@@ -744,6 +908,7 @@ public class SCLauncherActivity extends AppCompatActivity {
             intent.putExtra(SCGameActivity.EXTRA_DIRDATA, dirData);
             intent.putExtra(SCGameActivity.EXTRA_DIRCACHE, dirCache);
             intent.putExtra(SCGameActivity.EXTRA_NATIVELIBDIR, nativeLibDir);
+            intent.putExtra(SCGameActivity.EXTRA_GPU_MODE, mGpuMode);
             startActivity(intent);
         } catch (final Exception e) {
             LogFile.error("Launch failed", e);

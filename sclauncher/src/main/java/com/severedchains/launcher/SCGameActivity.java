@@ -45,6 +45,7 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
     public static final String EXTRA_DIRDATA = "dirdata";
     public static final String EXTRA_DIRCACHE = "dircache";
     public static final String EXTRA_NATIVELIBDIR = "nativelibdir";
+    public static final String EXTRA_GPU_MODE = "gpumode";
 
     private SurfaceView surfaceView;
     private TouchGamepadView gamepadView;
@@ -132,7 +133,13 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
         }
 
         LogFile.log("SCGameActivity onCreate");
-        SCActionTrail.record("Game screen opened");
+        String gpuMode = getIntent() != null
+                ? getIntent().getStringExtra(EXTRA_GPU_MODE) : null;
+        if (gpuMode == null) gpuMode = "snapdragon";
+        SCLogger.appendToLog("GPU mode: " + gpuMode
+                + ("mali".equals(gpuMode)
+                        ? " (cull-off tmd.gsh)" : " (stock shaders)"));
+        SCActionTrail.record("Game screen opened [GPU:" + gpuMode + "]");
         // Game output stays in backend files (latestlog.txt); no on-screen log.
         SCLogger.begin(getFilesDir());
 

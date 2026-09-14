@@ -85,6 +85,45 @@
                 android:layout_marginTop="4dp"
                 android:layout_marginBottom="12dp" />
 
+            <TextView
+                android:id="@+id/gpuModeText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="GPU: detecting..."
+                android:textSize="14sp"
+                android:textColor="#FFCC66"
+                android:gravity="center"
+                android:layout_marginTop="4dp"
+                android:layout_marginBottom="4dp" />
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center"
+                android:layout_marginBottom="8dp">
+
+                <Button
+                    android:id="@+id/snapdragonButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Snapdragon"
+                    android:textSize="14sp"
+                    android:paddingHorizontal="24dp"
+                    android:paddingVertical="12dp"
+                    android:layout_marginEnd="6dp" />
+
+                <Button
+                    android:id="@+id/maliButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Mali (fix)"
+                    android:textSize="14sp"
+                    android:paddingHorizontal="24dp"
+                    android:paddingVertical="12dp" />
+
+            </LinearLayout>
+
             <Button
                 android:id="@+id/searchAgainButton"
                 android:layout_width="wrap_content"
