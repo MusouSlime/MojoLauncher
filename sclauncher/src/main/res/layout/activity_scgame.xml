@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Game screen: full-screen render surface + touch-controller overlay.
+     No PAD toggle button: the overlay is always visible until a physical
+     BT/USB controller connects (SCGameActivity hides it then). -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <SurfaceView
+        android:id="@+id/gameSurface"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- Touch controls (D-pad + buttons). Visibility is driven by code. -->
+    <com.severedchains.launcher.ui.TouchGamepadView
+        android:id="@+id/gameGamepad"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="visible" />
+
+    <!-- Hidden IME target: the soft keyboard types here and each char is
+         forwarded to the game as SDL key events (Mojo's SDL text-input path
+         is stubbed, so the game can never summon a keyboard by itself).
+         1px, transparent, focusable — never visible to the player. -->
+    <EditText
+        android:id="@+id/gameKeyboardInput"
+        android:layout_width="2dp"
+        android:layout_height="2dp"
+        android:layout_gravity="top|start"
+        android:background="@android:color/transparent"
+        android:cursorVisible="false"
+        android:textColor="@android:color/transparent"
+        android:inputType="text|textNoSuggestions"
+        android:imeOptions="actionDone"
+        android:importantForAutofill="noExcludeDescendants" />
+
+    <!-- Virtual-keyboard button (name entry etc.): pinned to the LEFT edge,
+         always visible — even when a physical controller hides the touch
+         pad (controllers can't type either). -->
+    <Button
+        android:id="@+id/keyboardButton"
+        android:layout_width="56dp"
+        android:layout_height="56dp"
+        android:layout_gravity="start|center_vertical"
+        android:layout_marginStart="8dp"
+        android:alpha="0.6"
+        android:text="⌨"
+        android:textSize="22sp" />
+</FrameLayout>
