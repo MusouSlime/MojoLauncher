@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">SCLauncher</string>
+    <string name="launch_game">Launch Severed Chains</string>
+    <string name="checking_files">Checking game files...</string>
+    <string name="files_found">Game files found. Ready to launch.</string>
+    <string name="files_missing">Game files not found. Please place Severed Chains files in the game directory.</string>
+    <string name="launching">Launching...</string>
+    <string name="error_jre">JRE 25 not found. Please install JRE 25 via MojoLauncher first.</string>
+</resources>

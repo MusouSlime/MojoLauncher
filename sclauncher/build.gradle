@@ -1,0 +1,181 @@
+plugins {
+    id 'com.android.application' version '8.11.1'
+}
+
+android {
+    namespace 'com.severedchains.launcher'
+
+    compileSdk = 36
+
+    lint {
+        abortOnError false
+    }
+
+    defaultConfig {
+        applicationId "com.severedchains.launcher"
+        minSdkVersion 21
+        targetSdkVersion 36
+        versionCode 20260941
+        versionName "1.0.0-rg406h-gpumode3"
+        multiDexEnabled false
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        debug {
+            applicationIdSuffix '.debug'
+            minifyEnabled false
+            shrinkResources false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.debug
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    ndkVersion "29.0.14206865"
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('src/main/jni/CMakeLists.txt')
+        }
+    }
+
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    // Copy APK to central APKs folder after assemble
+    afterEvaluate {
+        task copyApkToCentral(type: Copy) {
+            from 'build/outputs/apk/debug'
+            into new File(project.projectDir, '../../../SCLauncher/APKs')
+            include '*.apk'
+            rename { String name -> "sclauncher-${name}" }
+            doLast {
+                println "Copied APK to ${destinationDir}"
+            }
+        }
+        tasks.assembleDebug.finalizedBy(copyApkToCentral)
+        tasks.assembleDebug.finalizedBy(packageReportZip)
+    }
+}
+
+// Rolling source+report zip, refreshed after EVERY build:
+// Backups/sclauncher-report.zip always matches the latest APK (stable name,
+// plus a BUILD-INFO.txt with version + APK md5 stamped at packaging time).
+// Heavy binaries (assets/, jniLibs/) are excluded by design — they ship
+// inside the APK; see REPORT.md for the rebuild inputs.
+tasks.register('writeBuildInfo') {
+    // Order: APK must be copied centrally first (declared explicitly so
+    // Gradle validation accepts reading the APK as an input below).
+    dependsOn('copyApkToCentral')
+    def outDir = layout.buildDirectory.dir('report-staging')
+    // Re-stamp whenever the APK changes, so the md5 in the zip is never stale.
+    inputs.file(file('../../../SCLauncher/APKs/sclauncher-sclauncher-debug.apk'))
+    outputs.dir(outDir)
+    doLast {
+        def d = outDir.get().asFile
+        d.mkdirs()
+        def apk = file('../../../SCLauncher/APKs/sclauncher-sclauncher-debug.apk')
+        def md5 = 'n/a (APK not found)'
+        def size = 'n/a'
+        if (apk.exists()) {
+            def dig = java.security.MessageDigest.getInstance('MD5')
+            apk.eachByte(8192) { byte[] buf, int n -> dig.update(buf, 0, n) }
+            md5 = dig.digest().encodeHex().toString()
+            size = "${apk.length()} bytes"
+        }
+        def vc = android.defaultConfig.versionCode
+        def vn = android.defaultConfig.versionName
+        new File(d, 'BUILD-INFO.txt').text =
+            "SCLauncher build info\n" +
+            "Built: ${new Date().format("yyyy-MM-dd HH:mm:ss")}\n" +
+            "versionCode: ${vc}\n" +
+            "versionName: ${vn}\n" +
+            "APK: ${apk.name} (${size})\n" +
+            "APK md5: ${md5}\n"
+        println "BUILD-INFO: v${vn} (${vc}), apk md5=${md5}"
+    }
+}
+
+tasks.register('packageReportZip', Zip) {
+    dependsOn('writeBuildInfo', 'copyApkToCentral')
+    archiveFileName = 'sclauncher-report.zip'
+    destinationDirectory.set(layout.projectDirectory.dir('../../../SCLauncher/Backups'))
+    from('src') {
+        into 'sclauncher/src'
+        exclude 'main/assets/**', 'main/jniLibs/**', '**/build/**'
+    }
+    from('build.gradle') { into 'sclauncher' }
+    from('../../../SCLauncher/README.md') { into '' }
+    from('../../../SCLauncher/Backups') {
+        into 'Backups'
+        include 'RESUME.md', 'REPORT.md', 'lod-game-snapshot.pristine.jar'
+    }
+    from(layout.buildDirectory.dir('report-staging')) { into '' }
+}
+
+// LWJGL JNI glue must live in jniLibs (app classloader namespace, full
+// system access). The same .so files inside *-natives-*.jar assets extract to
+// cache/lwjgl_native (clns-4 namespace) where their system DT_NEEDED chain
+// (libbinder, libandroid_runtime, ...) is not accessible -> linker spam +
+// "Failed to load a library". Pure libs (opus/spvc/shaderc) stay jar-only.
+// This task keeps jniLibs in sync with the asset jars on every build.
+tasks.register('syncLwjglGlueLibs') {
+    doLast {
+        def assetsDir = file('src/main/assets/sclauncher_natives')
+        def jniDir = file('src/main/jniLibs/arm64-v8a')
+        def mapping = [
+            'lwjgl-natives-linux-arm64-3.4.3.jar'                : 'linux/arm64/org/lwjgl/liblwjgl.so',
+            'lwjgl-opengl-natives-linux-arm64-3.4.3.jar'         : 'linux/arm64/org/lwjgl/opengl/liblwjgl_opengl.so',
+            'lwjgl-opengles-natives-linux-arm64-3.4.3.jar'       : 'linux/arm64/org/lwjgl/opengles/liblwjgl_opengles.so',
+            'lwjgl-stb-natives-linux-arm64-3.4.3.jar'            : 'linux/arm64/org/lwjgl/stb/liblwjgl_stb.so',
+        ]
+        jniDir.mkdirs()
+        mapping.each { jarName, innerPath ->
+            def jarFile = new File(assetsDir, jarName)
+            if (!jarFile.exists()) {
+                throw new GradleException("Missing LWJGL natives jar: ${jarFile}")
+            }
+            def soName = innerPath.substring(innerPath.lastIndexOf('/') + 1)
+            def outFile = new File(jniDir, soName)
+            def zf = new java.util.zip.ZipFile(jarFile)
+            try {
+                def entry = zf.getEntry(innerPath)
+                if (entry == null) throw new GradleException("Missing ${innerPath} in ${jarName}")
+                zf.getInputStream(entry).withStream { ins ->
+                    outFile.withOutputStream { outs -> outs << ins }
+                }
+                println "synced ${soName} (${outFile.length()} bytes)"
+            } finally {
+                zf.close()
+            }
+        }
+    }
+}
+tasks.named('preBuild').configure { dependsOn('syncLwjglGlueLibs') }
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.2.1'
+    implementation 'androidx.activity:activity:1.9.0'
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.annotation:annotation:1.10.0'
+    implementation 'org.tukaani:xz:1.10'
+    implementation project(':sdl:jni_bindings')
+    implementation project(':mojoexec:jni_bindings')
+    implementation fileTree(dir: 'libs', include: ['*.jar', '*.aar'])
+}
