@@ -520,6 +520,14 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
             SDLActivity.setGrabListener(enabled -> {});
             SDLActivity.setCursorCallback(cursor -> {});
             SCLogger.appendToLog("SDL initialized");
+            // SDL's stock assertion path is modal and its macro LOOPS on the
+            // value the dialog reports (SDL_ASSERTION_RETRY). Mojo's SDL has
+            // assertions live, so install a handler that logs + ignores.
+            if (SCSdlNative.installAssertHandler()) {
+                SCLogger.appendToLog("SDL assertion handler installed (asserts logged, never modal)");
+            } else {
+                SCLogger.appendToLog("SDL assertion handler NOT installed (will rely on the messagebox fallback)");
+            }
             // NOTE: virtual gamepad attaches lazily on first button press
             // (SCGamepadNative), i.e. after the game ran SDL_Init — attaching
             // earlier trips an SDL assertion inside SDL_OpenJoystick.
@@ -1117,6 +1125,16 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
      * assert can never SIGABRT the app via CheckJNI again. Must stay public
      * with this exact signature.
      */
+    // SDL_AssertState.SDL_ASSERTION_ALWAYS_IGNORE
+    private static final int SDL_ASSERTION_ALWAYS_IGNORE = 4;
+
+    // Native messageboxes are deduplicated + rate-limited: a failing SDL assert
+    // used to reach this method ~2000 times a second and wrote a line each time.
+    private static final java.util.HashMap<String, Integer> sMessageBoxSeen = new java.util.HashMap<>();
+    private static final int MESSAGEBOX_LOG_FIRST = 3;
+    private static final int MESSAGEBOX_LOG_EVERY = 500;
+    private static final int MESSAGEBOX_MAX_KEYS = 64;
+
     public int messageboxShowMessageBox(
             final int flags,
             final String title,
@@ -1125,9 +1143,58 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
             final int[] buttonIds,
             final String[] buttonTexts,
             final int[] colors) {
-        String line = "SDL messagebox [" + title + "]: " + message;
-        LogFile.error(line);
-        SCLogger.appendToLog(line);
+        final String line = "SDL messagebox [" + title + "]: " + message;
+
+        // Never answer an assertion with "Retry". SDL's assert macro is
+        //     while (!(condition)) { state = SDL_ReportAssertion(...);
+        //                            if (state == RETRY) continue; ... }
+        // and the assertion dialog's FIRST button is Retry (= 0), which is what
+        // the old "return the first button" auto-dismiss returned. One failing
+        // assert then re-ran forever, re-entering here and writing a log line
+        // every iteration (a 1.0.28+ device report showed 25,932 of them). We
+        // answer "Always Ignore" instead, so SDL drops that assert site for
+        // good -- what a desktop user pressing "Always Ignore" gets.
+        final int button = chooseMessageBoxButton(title, message, buttonIds, buttonTexts);
+
+        synchronized (sMessageBoxSeen) {
+            final Integer seenBoxed = sMessageBoxSeen.get(line);
+            final int seen = seenBoxed == null ? 0 : seenBoxed;
+            if (sMessageBoxSeen.size() < MESSAGEBOX_MAX_KEYS || seenBoxed != null) {
+                sMessageBoxSeen.put(line, seen + 1);
+            }
+            // Log the first few, then sample: keeps the shape of a storm visible
+            // without filling the log file or hammering the disk.
+            if (seen < MESSAGEBOX_LOG_FIRST || (seen % MESSAGEBOX_LOG_EVERY) == 0) {
+                LogFile.error(line + (seen > 0 ? "  (repeat #" + (seen + 1) + ")" : ""));
+                SCLogger.appendToLog(line + (seen > 0 ? "  (repeat #" + (seen + 1) + ")" : ""));
+            }
+        }
+        return button;
+    }
+
+    /**
+     * Buttons for the SDL assertion dialog are Retry / Break / Abort / Ignore /
+     * Always Ignore, in that order, with SDL_AssertState values as their ids.
+     * Prefer the "Always Ignore" button by name; fall back to its constant when
+     * the dialog looks like an assertion. Ordinary messageboxes keep the old
+     * behaviour (first button).
+     */
+    private static int chooseMessageBoxButton(
+            final String title, final String message, final int[] buttonIds, final String[] buttonTexts) {
+        if (buttonTexts != null) {
+            for (int i = 0; i < buttonTexts.length; i++) {
+                final String text = buttonTexts[i];
+                if (text != null && text.trim().equalsIgnoreCase("Always Ignore")) {
+                    return (buttonIds != null && i < buttonIds.length) ? buttonIds[i] : SDL_ASSERTION_ALWAYS_IGNORE;
+                }
+            }
+        }
+        final boolean assertion =
+                (title != null && title.toLowerCase(java.util.Locale.ROOT).contains("assert"))
+                        || (message != null && message.contains("Assertion failure"));
+        if (assertion) {
+            return SDL_ASSERTION_ALWAYS_IGNORE;
+        }
         return (buttonIds != null && buttonIds.length > 0) ? buttonIds[0] : -1;
     }
 }

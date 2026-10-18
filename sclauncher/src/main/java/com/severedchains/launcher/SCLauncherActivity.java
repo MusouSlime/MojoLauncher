@@ -2093,25 +2093,39 @@ public class SCLauncherActivity extends AppCompatActivity {
             sb.append("--- vulkan probe failed: ").append(e.getMessage()).append(" ---\n");
         }
         File launcher = LogFile.getLogFile();
-        sb.append("\n--- launcher log ---\n").append(readTail(launcher, 256 * 1024));
+        sb.append("\n--- launcher log ---\n").append(readHeadTail(launcher, 128 * 1024, 256 * 1024));
         File latest = new File(getFilesDir(), "latestlog.txt");
-        sb.append("\n--- latestlog.txt (last game log) ---\n").append(readTail(latest, 512 * 1024));
+        // Head AND tail: a run-away native assert used to fill latestlog.txt with
+        // megabytes of repeats, so a tail-only report lost the beginning of the
+        // storm -- the part that says what actually went wrong first.
+        sb.append("\n--- latestlog.txt (last game log: head + tail) ---\n")
+                .append(readHeadTail(latest, 256 * 1024, 512 * 1024));
         sb.append("\n--- last actions ---\n").append(SCActionTrail.dump());
         return sb.toString();
     }
 
-    /** Last maxBytes of f (whole file when smaller); friendly note when absent. */
-    private static String readTail(File f, long maxBytes) {
+    /**
+     * First {@code headBytes} plus last {@code tailBytes} of {@code f} (whole
+     * file when smaller), with an elision note for whatever is skipped.
+     */
+    private static String readHeadTail(File f, long headBytes, long tailBytes) {
         if (f == null || !f.exists()) return "(no log file yet)\n";
         try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "r")) {
-            long len = raf.length();
-            long start = Math.max(0, len - maxBytes);
-            raf.seek(start);
-            byte[] buf = new byte[(int) (len - start)];
-            int n = 0, r;
-            while (n < buf.length && (r = raf.read(buf, n, buf.length - n)) != -1) n += r;
-            String prefix = start > 0 ? "[... truncated " + start + " bytes ...]\n" : "";
-            return prefix + new String(buf, 0, n, "UTF-8") + "\n";
+            final long len = raf.length();
+            if (len <= headBytes + tailBytes) {
+                byte[] all = new byte[(int) len];
+                raf.readFully(all);
+                return new String(all, "UTF-8") + "\n";
+            }
+            byte[] head = new byte[(int) headBytes];
+            raf.seek(0);
+            raf.readFully(head);
+            byte[] tail = new byte[(int) tailBytes];
+            raf.seek(len - tailBytes);
+            raf.readFully(tail);
+            return new String(head, "UTF-8")
+                    + "\n[... elided " + (len - headBytes - tailBytes) + " bytes in the middle ...]\n"
+                    + new String(tail, "UTF-8") + "\n";
         } catch (Exception e) {
             return "(could not read " + f.getName() + ": " + e.getMessage() + ")\n";
         }

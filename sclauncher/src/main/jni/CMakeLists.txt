@@ -7,6 +7,8 @@ project("jvmrunner" LANGUAGES C)
 #   sc_gamepad    - virtual SDL3 controller (touch + physical mirroring)
 #   sc_audio_probe- OpenAL backend diagnostics (dlopen + device probe)
 #   sc_sdlprobe   - queries SDL_TextInputActive() (auto soft keyboard)
+#   sc_sdlassert  - installs an SDL assertion handler that logs + ignores,
+#                   so a failing assert can never loop the messagebox forever
 add_library(jvmrunner SHARED jvmrunner.c)
 
 add_library(sc_logger SHARED sc_logger.c)
@@ -16,6 +18,8 @@ add_library(sc_gamepad SHARED sc_gamepad.c)
 add_library(sc_audio_probe SHARED sc_audio_probe.c)
 
 add_library(sc_sdlprobe SHARED sc_sdlprobe.c)
+
+add_library(sc_sdlassert SHARED sc_sdlassert.c)
 
 # NOTE: absolute SDL include path is a local-machine path (this dev box).
 # sc_gamepad only needs it at compile time; runtime resolution is via dlsym.
@@ -36,6 +40,11 @@ target_link_libraries(sc_audio_probe
 )
 
 target_link_libraries(sc_sdlprobe
+    log
+    dl
+)
+
+target_link_libraries(sc_sdlassert
     log
     dl
 )
