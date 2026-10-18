@@ -88,7 +88,7 @@ public final class GameJarPatcher {
      * {@link #fingerprint()} so it cannot be forgotten again). It is logged on
      * every launch, which makes a stale patch visible in a device report.
      */
-    public static final String PATCH_REVISION = "r21";
+    public static final String PATCH_REVISION = "r22";
 
     /** Rewritten {@code expectedWidth} for the retail widescreen branch. */
     private static final int EXPECTED_WIDTH_FROM = 368;
@@ -106,6 +106,26 @@ public final class GameJarPatcher {
      * bug is closed.
      */
     private static final boolean ENABLE_WIDESCREEN_DIAG = true;
+
+    /**
+     * EXPERIMENT: stop the retail textbox glyphs from carrying a per-character
+     * clip rectangle.
+     *
+     * <p>{@code Text} is the <b>only</b> class in the whole jar that calls
+     * {@code QueuedModelStandard.scissor(int,int,int,int)} (four call sites,
+     * verified), so a glyph's clip rect is the only per-model scissor in the
+     * game -- and "the dialogue box draws with no text in it" is precisely the
+     * symptom of that rect not covering the glyph. The rewrite drops the four
+     * computed arg values and passes 0,0,0,0 instead; {@code GlesApi.scissor}
+     * treats an empty model scissor as "no model clip" and falls back to the
+     * model's world scissor (the full frame). Straight-line, no new branch
+     * targets, net stack unchanged, so COMPUTE_MAXS stays valid.
+     *
+     * <p>Cost if it is kept: glyphs are no longer clipped at the textbox edge,
+     * which can look slightly wrong for scrolling multi-line text. Nothing else
+     * in the game loses clipping.
+     */
+    private static final boolean ENABLE_GLYPH_SCISSOR_BYPASS = true;
 
     /**
      * UI-on-top render-order patch. Off: it did not fix the missing death
@@ -298,6 +318,7 @@ public final class GameJarPatcher {
     private static final String SCISSORSTACK_OWNER = "legend/core/renderer/ScissorStack";
     private static final String TRANSFORMATIONS_ENTRY = "legend/core/Transformations.class";
     private static final String TRANSFORMATIONS_OWNER = "legend/core/Transformations";
+    private static final String TEXT_ENTRY = "legend/game/Text.class";
     private static final String GAMEENGINE_OWNER = "legend/core/GameEngine";
     private static final String QUEUEDMODEL_DESC = "Llegend/core/renderer/QueuedModel;";
     private static final String RENDERMODE_DESC = "Llegend/game/EngineState$RenderMode;";
@@ -321,6 +342,7 @@ public final class GameJarPatcher {
     private static final int PATCHED_GLESAPI = 512;
     private static final int PATCHED_SCISSORSTACK = 1024;
     private static final int PATCHED_TRANSFORMATIONS = 2048;
+    private static final int PATCHED_TEXT_SCISSOR = 4096;
 
     private GameJarPatcher() {}
 
@@ -415,10 +437,51 @@ public final class GameJarPatcher {
                 ENABLE_DEPTH_FLOAT_PATCH, ENABLE_FORCE_PS1DEPTH,
                 ENABLE_FORCE_LEGACY, ENABLE_DECOUPLE_BATTLE,
                 ENABLE_DECOUPLE_WIDESCREEN, ENABLE_SCREENSPACE_FIX,
+                ENABLE_WIDESCREEN_DIAG, ENABLE_GLYPH_SCISSOR_BYPASS,
                 EXPECTED_WIDTH_FROM, EXPECTED_WIDTH_TO,
                 GL_TRIANGLES, GL_TRIANGLES_ADJACENCY, UNPACK_THREADS,
         });
         return Integer.toHexString(h);
+    }
+
+    /**
+     * {@link #ENABLE_GLYPH_SCISSOR_BYPASS}: rewrite the four
+     * {@code QueuedModelStandard.scissor(IIII)} call sites in {@code Text} to
+     * pass {@code 0,0,0,0}. The receiver is left on the stack, the four
+     * computed ints are dropped and four zeros pushed in their place, so the
+     * stack shape, max stack and (branch-free) StackMapTable are unchanged.
+     */
+    private static byte[] transformTextGlyphScissors(final byte[] input) {
+        final ClassReader reader = new ClassReader(input);
+        final ClassWriter writer = new ClassWriter(reader, ClassWriter.COMPUTE_MAXS);
+
+        final ClassVisitor visitor = new ClassVisitor(Opcodes.ASM9, writer) {
+            @Override
+            public MethodVisitor visitMethod(final int access, final String name, final String descriptor,
+                                             final String signature, final String[] exceptions) {
+                final MethodVisitor mv = super.visitMethod(access, name, descriptor, signature, exceptions);
+                return new MethodVisitor(Opcodes.ASM9, mv) {
+                    @Override
+                    public void visitMethodInsn(final int opcode, final String owner, final String methodName,
+                                                final String methodDesc, final boolean itf) {
+                        if (opcode == Opcodes.INVOKEVIRTUAL
+                                && "scissor".equals(methodName)
+                                && ("(IIII)" + QUEUEDMODEL_DESC).equals(methodDesc)) {
+                            for (int i = 0; i < 4; i++) {
+                                super.visitInsn(Opcodes.POP);
+                            }
+                            for (int i = 0; i < 4; i++) {
+                                super.visitInsn(Opcodes.ICONST_0);
+                            }
+                        }
+                        super.visitMethodInsn(opcode, owner, methodName, methodDesc, itf);
+                    }
+                };
+            }
+        };
+
+        reader.accept(visitor, 0);
+        return writer.toByteArray();
     }
 
     /**
@@ -525,6 +588,10 @@ public final class GameJarPatcher {
                 if (msg.length() > 0) msg.append(" + ");
                 msg.append("screen space = 0-based (target arrow)");
             }
+            if ((patched & PATCHED_TEXT_SCISSOR) != 0) {
+                if (msg.length() > 0) msg.append(" + ");
+                msg.append("glyph scissors off (test)");
+            }
             if ((patched & PATCHED_GENERICSPRITE) != 0) {
                 if (msg.length() > 0) msg.append(" + ");
                 msg.append("effect sprites opaque (test)");
@@ -588,6 +655,9 @@ public final class GameJarPatcher {
                 } else if (ENABLE_SCREENSPACE_FIX && TRANSFORMATIONS_ENTRY.equals(entry.getName())) {
                     patched |= PATCHED_TRANSFORMATIONS;
                     zos.write(transformTransformations(readAll(zis)));
+                } else if (ENABLE_GLYPH_SCISSOR_BYPASS && TEXT_ENTRY.equals(entry.getName())) {
+                    patched |= PATCHED_TEXT_SCISSOR;
+                    zos.write(transformTextGlyphScissors(readAll(zis)));
                 } else {
                     int n;
                     while ((n = zis.read(buf)) != -1) {
