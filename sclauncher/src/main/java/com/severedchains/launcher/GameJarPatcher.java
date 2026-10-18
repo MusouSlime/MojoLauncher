@@ -66,7 +66,7 @@ public final class GameJarPatcher {
 
     /** Sidecar marker filename; stores the patched jar's md5. Bump the name on
      *  a patch revision so the launcher re-seeds from the pristine asset. */
-    public static final String MARKER = ".gamejar_patch_v19";
+    public static final String MARKER = ".gamejar_patch_v20";
 
     /**
      * UI-on-top render-order patch. Off: it did not fix the missing death
@@ -190,6 +190,34 @@ public final class GameJarPatcher {
      */
     private static final boolean ENABLE_DECOUPLE_WIDESCREEN = true;
 
+    /**
+     * FIX: make the modern (PERSPECTIVE) screen-space conversion return
+     * coordinates in the same 0-based space the 2D ortho projection uses.
+     *
+     * <p>{@code Transformations.toScreenspace} has two branches. The LEGACY one
+     * uses the PS1 GTE and returns 0-based PS1 screen coordinates (0..320 x
+     * 0..240). The modern one multiplies the NDC by half the extent:
+     * {@code out.x = ndc.x / 2 * scale} and {@code out.y = -ndc.y / 2 * height}
+     * — i.e. it returns <i>centred</i> coordinates (-w/2..w/2), while the 2D
+     * ortho projection is 0-based (0..w). Every consumer that positions a 2D
+     * element from that result is therefore off by half the screen: the battle
+     * target arrow (the "enemy select" cursor) lands off-screen for enemies on
+     * the left, and the floating damage numbers pile up against the left edge
+     * (the game's own {@code clampX}/{@code clampY} expect 0..320 / 0..240,
+     * which is the giveaway).
+     *
+     * <p>The patch remaps NDC [-1,1] to [0,1] in both axes (adding 0.5 to each
+     * NDC term) and subtracts the widescreen ortho offset from x, because
+     * {@code RenderBatch.queueOrthoModel} adds that offset to every 2D model —
+     * the UI needs it (it is laid out in 0..320 space), but an element placed
+     * from a world coordinate is already in screen space and must not get it
+     * twice.
+     *
+     * <p>Only the modern branch is touched: the LEGACY branch returns early
+     * and is already correct (it is what the title screen and submap use).
+     */
+    private static final boolean ENABLE_SCREENSPACE_FIX = true;
+
     private static final String GLESMESH_ENTRY = "legend/core/renderer/opengles/GlesMesh.class";
     private static final String GLESMESH_OWNER = "legend/core/renderer/opengles/GlesMesh";
     private static final String FIELD_MODE = "mode";
@@ -229,6 +257,9 @@ public final class GameJarPatcher {
     private static final String GLESAPI_ENTRY = "legend/core/renderer/opengles/GlesApi.class";
     private static final String SCISSORSTACK_ENTRY = "legend/core/renderer/ScissorStack.class";
     private static final String SCISSORSTACK_OWNER = "legend/core/renderer/ScissorStack";
+    private static final String TRANSFORMATIONS_ENTRY = "legend/core/Transformations.class";
+    private static final String TRANSFORMATIONS_OWNER = "legend/core/Transformations";
+    private static final String GAMEENGINE_OWNER = "legend/core/GameEngine";
     private static final String QUEUEDMODEL_DESC = "Llegend/core/renderer/QueuedModel;";
     private static final String RENDERMODE_DESC = "Llegend/game/EngineState$RenderMode;";
     private static final String SHADEROPTS_TMD_ENTRY = "legend/core/renderer/ShaderOptionsTmd.class";
@@ -250,6 +281,7 @@ public final class GameJarPatcher {
     private static final int PATCHED_RENDERBATCH = 256;
     private static final int PATCHED_GLESAPI = 512;
     private static final int PATCHED_SCISSORSTACK = 1024;
+    private static final int PATCHED_TRANSFORMATIONS = 2048;
 
     private GameJarPatcher() {}
 
@@ -359,6 +391,10 @@ public final class GameJarPatcher {
                 if (msg.length() > 0) msg.append(" + ");
                 msg.append("widescreen gates = legacy (viewport/scissor)");
             }
+            if ((patched & PATCHED_TRANSFORMATIONS) != 0) {
+                if (msg.length() > 0) msg.append(" + ");
+                msg.append("screen space = 0-based (target arrow)");
+            }
             if ((patched & PATCHED_GENERICSPRITE) != 0) {
                 if (msg.length() > 0) msg.append(" + ");
                 msg.append("effect sprites opaque (test)");
@@ -419,6 +455,9 @@ public final class GameJarPatcher {
                 } else if (ENABLE_DECOUPLE_WIDESCREEN && SCISSORSTACK_ENTRY.equals(entry.getName())) {
                     patched |= PATCHED_SCISSORSTACK;
                     zos.write(transformWidescreenGates(readAll(zis), true));
+                } else if (ENABLE_SCREENSPACE_FIX && TRANSFORMATIONS_ENTRY.equals(entry.getName())) {
+                    patched |= PATCHED_TRANSFORMATIONS;
+                    zos.write(transformTransformations(readAll(zis)));
                 } else {
                     int n;
                     while ((n = zis.read(buf)) != -1) {
@@ -820,7 +859,27 @@ public final class GameJarPatcher {
                 }
 
                 if (ENABLE_DECOUPLE_BATTLE && "updateProjections".equals(name) && "()V".equals(descriptor)) {
-                    return new LegacyRenderMode(mv);
+                    return new LegacyRenderMode(mv) {
+                        @Override
+                        public void visitIntInsn(final int opcode, final int operand) {
+                            // The legacy branch sets expectedWidth = 368 for the
+                            // retail "expanded submap" mode. In this port that
+                            // value is only ever consumed by the scissor maths
+                            // (GlesApi.scissor / ScissorStack.setRescale), which
+                            // multiplies by expectedWidth/nativeWidth — so 368
+                            // scales every scissor rectangle by 1.15 and clips
+                            // the battle HUD portrait (and the HP/MP/SP labels)
+                            // out of its own box. The 2D ortho projection built
+                            // right above is 0..w (no such factor), so the
+                            // scissor must not have it either: keep the PS1
+                            // width at 320.
+                            if(opcode == Opcodes.SIPUSH && operand == 368) {
+                                super.visitIntInsn(opcode, 320);
+                            } else {
+                                super.visitIntInsn(opcode, operand);
+                            }
+                        }
+                    };
                 }
 
                 return mv;
@@ -843,7 +902,7 @@ public final class GameJarPatcher {
      * instruction's pushed value is popped and replaced with the constant, so
      * the surrounding stack shape and branch structure are unchanged.
      */
-    private static final class LegacyRenderMode extends MethodVisitor {
+    private static class LegacyRenderMode extends MethodVisitor {
         LegacyRenderMode(final MethodVisitor mv) {
             super(Opcodes.ASM9, mv);
         }
@@ -868,6 +927,109 @@ public final class GameJarPatcher {
             } else {
                 super.visitMethodInsn(opcode, owner, name, desc, itf);
             }
+        }
+    }
+
+    /**
+     * {@link #ENABLE_SCREENSPACE_FIX}: remap the modern branch of
+     * {@code Transformations.toScreenspace} from centred NDC coordinates to the
+     * 0-based space the 2D ortho projection uses.
+     *
+     * <p>The method computes (modern branch):
+     * <pre>
+     *   out.x = (vec.x / vec.w / 2) * (nativeWidth * renderAspect / nativeAspectRatio)
+     *   out.y = (-vec.y / vec.w / 2) * nativeHeight
+     * </pre>
+     * which yields -w/2..w/2 and -h/2..h/2. The 2D ortho projection is 0-based
+     * (0..w, 0..h), so every consumer is off by half the screen.
+     *
+     * <p>The rewrite is purely arithmetic and shape-preserving:
+     * <ul>
+     *   <li>after each {@code fdiv} by 2, add 0.5 — turning the NDC [-1,1] into
+     *       [0,1] before the extent multiply;</li>
+     *   <li>after the x multiply, subtract
+     *       {@code RENDERER.getWidescreenOrthoOffsetX()} — every 2D model gets
+     *       that offset in {@code RenderBatch.queueOrthoModel}, so an element
+     *       placed from a world coordinate (the battle target arrow, the
+     *       floating damage numbers, the lens flare) would otherwise get it
+     *       twice.</li>
+     * </ul>
+     * The LEGACY branch returns early and is left untouched: the GTE already
+     * returns 0-based PS1 coordinates, which is what that branch's consumers
+     * (title screen, submap) expect.
+     */
+    private static byte[] transformTransformations(final byte[] input) {
+        final ClassReader reader = new ClassReader(input);
+        final ClassWriter writer = new ClassWriter(reader, ClassWriter.COMPUTE_MAXS);
+
+        final ClassVisitor visitor = new ClassVisitor(Opcodes.ASM9, writer) {
+            @Override
+            public MethodVisitor visitMethod(final int access, final String name, final String descriptor,
+                                             final String signature, final String[] exceptions) {
+                final MethodVisitor mv = super.visitMethod(access, name, descriptor, signature, exceptions);
+                if("toScreenspace".equals(name)
+                        && ("(Lorg/joml/Vector3f;Llegend/core/gte/MV;Lorg/joml/Vector2f;)V").equals(descriptor)) {
+                    return new ScreenSpaceFixer(mv);
+                }
+                return mv;
+            }
+        };
+
+        reader.accept(visitor, 0);
+        return writer.toByteArray();
+    }
+
+    /**
+     * Rewrites the arithmetic of {@code Transformations.toScreenspace}'s modern
+     * branch: NDC [-1,1] becomes [0,1] on both axes, and the x result has the
+     * widescreen ortho offset removed.
+     */
+    private static final class ScreenSpaceFixer extends MethodVisitor {
+        /** The previous instruction was {@code fconst_2}, so the next fdiv is a "÷2". */
+        private boolean afterFconst2;
+        /** The previous instruction was an fdiv (identifies the x extent multiply). */
+        private boolean afterFdiv;
+
+        ScreenSpaceFixer(final MethodVisitor mv) {
+            super(Opcodes.ASM9, mv);
+        }
+
+        @Override
+        public void visitInsn(final int opcode) {
+            super.visitInsn(opcode);
+            if(opcode == Opcodes.FCONST_2) {
+                this.afterFconst2 = true;
+                return;
+            }
+            if(opcode == Opcodes.FDIV) {
+                if(this.afterFconst2) {
+                    // (ndc / 2) -> (ndc / 2 + 0.5): NDC [-1,1] -> [0,1]
+                    super.visitLdcInsn(0.5f);
+                    super.visitInsn(Opcodes.FADD);
+                }
+                this.afterFconst2 = false;
+                this.afterFdiv = true;
+                return;
+            }
+            if(opcode == Opcodes.FMUL) {
+                if(this.afterFdiv) {
+                    // The x extent multiply: it is the only fmul directly
+                    // after an fdiv (the y one follows an i2f). Subtract the
+                    // widescreen ortho offset, which queueOrthoModel adds to
+                    // every 2D model afterwards.
+                    super.visitInsn(Opcodes.DUP);
+                    super.visitFieldInsn(Opcodes.GETSTATIC, GAMEENGINE_OWNER, "RENDERER",
+                            "L" + RENDERENGINE_OWNER + ";");
+                    super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, RENDERENGINE_OWNER,
+                            "getWidescreenOrthoOffsetX", "()F", false);
+                    super.visitInsn(Opcodes.FSUB);
+                    super.visitInsn(Opcodes.SWAP);
+                    super.visitInsn(Opcodes.POP);
+                }
+                this.afterFdiv = false;
+                return;
+            }
+            this.afterFdiv = false;
         }
     }
 
