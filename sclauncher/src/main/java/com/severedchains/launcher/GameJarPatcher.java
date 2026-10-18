@@ -95,6 +95,19 @@ public final class GameJarPatcher {
     private static final int EXPECTED_WIDTH_TO = 320;
 
     /**
+     * TEMPORARY diagnostic: print the live widescreen state from
+     * {@code RenderBatch.updateProjections()} to stderr (which the launcher
+     * captures into latestlog.txt, and therefore Send Log). The game logs
+     * nothing about the resolved projection, and {@code config.dcnf} is binary,
+     * so this is the only way to see from a device report which widescreen
+     * branch ran, with what {@code expectedWidth}/{@code widescreenOrthoOffsetX}
+     * and which ortho matrix. Called rarely (resize / widescreen option change /
+     * resizeRenderBuffers), so it cannot spam. Remove once the widescreen text
+     * bug is closed.
+     */
+    private static final boolean ENABLE_WIDESCREEN_DIAG = true;
+
+    /**
      * UI-on-top render-order patch. Off: it did not fix the missing death
      * effect and reordering the passes made some 3D geometry draw out of order.
      * Kept (see {@link #transformRenderEngine}) so a reworked variant can be
@@ -319,6 +332,52 @@ public final class GameJarPatcher {
             this.patched = patched;
             this.message = message;
         }
+    }
+
+    /**
+     * TEMPORARY diagnostic helpers (see {@link #ENABLE_WIDESCREEN_DIAG}).
+     *
+     * <p>Each emits a straight-line {@code System.err} print with no branch
+     * targets, so the surrounding method's StackMapTable stays valid under
+     * {@code COMPUTE_MAXS}. They are written to the delegate visitor on purpose:
+     * routing them through {@link LegacyRenderMode} would rewrite the
+     * {@code renderMode} read they are meant to observe.
+     */
+    private static void diagStr(final MethodVisitor mv, final String s) {
+        mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "err", "Ljava/io/PrintStream;");
+        mv.visitLdcInsn(s);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/io/PrintStream", "print", "(Ljava/lang/String;)V", false);
+    }
+
+    private static void diagIntField(final MethodVisitor mv, final String owner, final String field) {
+        mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "err", "Ljava/io/PrintStream;");
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitFieldInsn(Opcodes.GETFIELD, owner, field, "I");
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/io/PrintStream", "println", "(I)V", false);
+    }
+
+    private static void diagFloatField(final MethodVisitor mv, final String owner, final String field) {
+        mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "err", "Ljava/io/PrintStream;");
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitFieldInsn(Opcodes.GETFIELD, owner, field, "F");
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/io/PrintStream", "println", "(F)V", false);
+    }
+
+    private static void diagObjectField(final MethodVisitor mv, final String owner, final String field,
+                                        final String desc) {
+        mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "err", "Ljava/io/PrintStream;");
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitFieldInsn(Opcodes.GETFIELD, owner, field, desc);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/io/PrintStream", "println", "(Ljava/lang/Object;)V", false);
+    }
+
+    /** Prints {@code this.engine.<getter>()} as an int (RenderEngine getters). */
+    private static void diagEngineInt(final MethodVisitor mv, final String getter) {
+        mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "err", "Ljava/io/PrintStream;");
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitFieldInsn(Opcodes.GETFIELD, RENDERBATCH_OWNER, "engine", "L" + RENDERENGINE_OWNER + ";");
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, RENDERENGINE_OWNER, getter, "()I", false);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/io/PrintStream", "println", "(I)V", false);
     }
 
     /**
@@ -931,6 +990,30 @@ public final class GameJarPatcher {
 
                 if (ENABLE_DECOUPLE_BATTLE && "updateProjections".equals(name) && "()V".equals(descriptor)) {
                     return new LegacyRenderMode(mv) {
+                        /** Saw the widescreen branch's expectedWidth push. */
+                        private boolean pendingExpanded;
+
+                        @Override
+                        public void visitCode() {
+                            super.visitCode();
+                            if (ENABLE_WIDESCREEN_DIAG) {
+                                // Straight-line only (no new branch targets), so
+                                // COMPUTE_MAXS stays valid. Emitted through the
+                                // delegate so LegacyRenderMode can't rewrite the
+                                // renderMode read here.
+                                diagStr(mv, "SCWIDE updateProjections: mode=");
+                                diagObjectField(mv, RENDERBATCH_OWNER, "renderMode", RENDERMODE_DESC);
+                                diagStr(mv, "SCWIDE nativeW=");
+                                diagIntField(mv, RENDERBATCH_OWNER, "nativeWidth");
+                                diagStr(mv, "SCWIDE nativeH=");
+                                diagIntField(mv, RENDERBATCH_OWNER, "nativeHeight");
+                                diagStr(mv, "SCWIDE renderW=");
+                                diagEngineInt(mv, "getRenderWidth");
+                                diagStr(mv, "SCWIDE renderH=");
+                                diagEngineInt(mv, "getRenderHeight");
+                            }
+                        }
+
                         @Override
                         public void visitIntInsn(final int opcode, final int operand) {
                             // The legacy branch sets expectedWidth = 368 for the
@@ -940,14 +1023,36 @@ public final class GameJarPatcher {
                             // multiplies by expectedWidth/nativeWidth — so 368
                             // scales every scissor rectangle by 1.15 and clips
                             // the battle HUD portrait (and the HP/MP/SP labels)
-                            // out of its own box. The 2D ortho projection built
-                            // right above is 0..w (no such factor), so the
-                            // scissor must not have it either: keep the PS1
-                            // width at 320.
-                            if(opcode == Opcodes.SIPUSH && operand == EXPECTED_WIDTH_FROM) {
+                            // out of its own box, and clips every glyph's
+                            // per-character scissor in the field, which is why
+                            // Extended showed a text box with no text. The 2D
+                            // ortho projection built right above is 0..w (no such
+                            // factor), so the scissor must not have it either:
+                            // keep the PS1 width at 320.
+                            if (opcode == Opcodes.SIPUSH && operand == EXPECTED_WIDTH_FROM) {
+                                this.pendingExpanded = true;
                                 super.visitIntInsn(opcode, EXPECTED_WIDTH_TO);
                             } else {
                                 super.visitIntInsn(opcode, operand);
+                            }
+                        }
+
+                        @Override
+                        public void visitFieldInsn(final int opcode, final String owner, final String fname,
+                                                   final String fdesc) {
+                            super.visitFieldInsn(opcode, owner, fname, fdesc);
+                            if (this.pendingExpanded && opcode == Opcodes.PUTFIELD
+                                    && RENDERBATCH_OWNER.equals(owner) && "expectedWidth".equals(fname)) {
+                                this.pendingExpanded = false;
+                                if (ENABLE_WIDESCREEN_DIAG) {
+                                    diagStr(mv, "SCWIDE EXPANDED expectedWidth=");
+                                    diagIntField(mv, RENDERBATCH_OWNER, "expectedWidth");
+                                    diagStr(mv, "SCWIDE EXPANDED wsoOffset=");
+                                    diagFloatField(mv, RENDERBATCH_OWNER, "widescreenOrthoOffsetX");
+                                    diagStr(mv, "SCWIDE EXPANDED ortho=");
+                                    diagObjectField(mv, RENDERBATCH_OWNER, "orthographicProjection",
+                                            "Lorg/joml/Matrix4f;");
+                                }
                             }
                         }
                     };
