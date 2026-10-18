@@ -1778,7 +1778,10 @@ public class SCLauncherActivity extends AppCompatActivity {
      * revision (never on a normal launch).
      */
     private void restorePristineGameJarIfNeeded(File mainJar) {
-        if (new File(gameDir, GameJarPatcher.MARKER).exists()) return;
+        // Content check, not existence: a marker written by an older patch
+        // revision must trigger the re-seed (that is how a stale jar patched
+        // before a patch change gets fixed without a manual file-name bump).
+        if (GameJarPatcher.isPatchRevisionCurrent(gameDir)) return;
         try {
             if (mainJar.exists()) {
                 try (InputStream in = getAssets().open("game/" + MAIN_JAR_NAME);

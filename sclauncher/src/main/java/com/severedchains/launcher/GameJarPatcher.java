@@ -64,9 +64,35 @@ import java.util.zip.ZipOutputStream;
 public final class GameJarPatcher {
     private static final String TAG = "GameJarPatcher";
 
-    /** Sidecar marker filename; stores the patched jar's md5. Bump the name on
-     *  a patch revision so the launcher re-seeds from the pristine asset. */
-    public static final String MARKER = ".gamejar_patch_v20";
+    /**
+     * Sidecar marker filename. Its <b>content</b> is
+     * {@code "<patched jar md5> <revision>"} (see {@link #PATCH_REVISION}), so a
+     * patch change only has to change {@link #PATCH_REVISION} -- the file name
+     * is bumped only to force a one-time re-seed of installs created by an
+     * older launcher.
+     *
+     * <p>History: this used to be a bare md5 with the revision in the file
+     * name, so a device that had already been patched kept its old jar forever
+     * unless the name was bumped by hand. The v1.0.34 scissor rewrite
+     * (368 -&gt; 320) shipped without a bump, so testers kept running the
+     * v1.0.33 jar: the wide-screen path then scaled every glyph's clip
+     * rectangle by 1.15 and clipped the dialogue text out of its box in
+     * "Extended" mode (Forced 4:3 was unaffected because that path never reads
+     * {@code expectedWidth}).
+     */
+    public static final String MARKER = ".gamejar_patch_v21";
+
+    /**
+     * Patch-revision stamp stored in the marker. <b>Change this whenever the
+     * patch behaviour changes</b> (and include any new behavioural input in
+     * {@link #fingerprint()} so it cannot be forgotten again). It is logged on
+     * every launch, which makes a stale patch visible in a device report.
+     */
+    public static final String PATCH_REVISION = "r21";
+
+    /** Rewritten {@code expectedWidth} for the retail widescreen branch. */
+    private static final int EXPECTED_WIDTH_FROM = 368;
+    private static final int EXPECTED_WIDTH_TO = 320;
 
     /**
      * UI-on-top render-order patch. Off: it did not fix the missing death
@@ -296,6 +322,47 @@ public final class GameJarPatcher {
     }
 
     /**
+     * True when the marker was written by <b>this</b> patch revision, i.e. the
+     * deployed jar is known to have been patched by the current code. Used by
+     * the launcher to decide whether to re-seed the pristine jar. Content-only
+     * (no jar hash) so it stays cheap on every launch; the patcher still
+     * verifies the jar's own md5.
+     */
+    public static boolean isPatchRevisionCurrent(final File markerDir) {
+        final File marker = new File(markerDir, MARKER);
+        if (!marker.isFile()) {
+            return false;
+        }
+        try {
+            return readText(marker).trim().endsWith(" " + PATCH_REVISION + "/" + fingerprint());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Behavioural fingerprint of the enabled patches: every flag and constant
+     * that changes what lands in the jar. Stored in the marker, so toggling any
+     * of them invalidates an existing patch automatically instead of relying on
+     * someone remembering to bump {@link #PATCH_REVISION} (which is how the
+     * v1.0.34 scissor rewrite was lost for a day).
+     */
+    private static String fingerprint() {
+        // Deterministic: Integer/Boolean hashCodes are value-based (no identity
+        // hashes), so the stamp is stable across processes and JVM versions.
+        final int h = java.util.Arrays.hashCode(new Object[] {
+                MARKER, PATCH_REVISION,
+                ENABLE_RENDERENGINE_PATCH, ENABLE_EFFECT_OPAQUE_PATCH,
+                ENABLE_DEPTH_FLOAT_PATCH, ENABLE_FORCE_PS1DEPTH,
+                ENABLE_FORCE_LEGACY, ENABLE_DECOUPLE_BATTLE,
+                ENABLE_DECOUPLE_WIDESCREEN, ENABLE_SCREENSPACE_FIX,
+                EXPECTED_WIDTH_FROM, EXPECTED_WIDTH_TO,
+                GL_TRIANGLES, GL_TRIANGLES_ADJACENCY, UNPACK_THREADS,
+        });
+        return Integer.toHexString(h);
+    }
+
+    /**
      * Patches {@code jar} once per content revision. Safe to call on every
      * launch: if the marker matches the jar's md5 it returns immediately.
      *
@@ -312,6 +379,7 @@ public final class GameJarPatcher {
         }
 
         final File marker = new File(markerDir, MARKER);
+        final String rev = PATCH_REVISION + "/" + fingerprint();
         String md5;
         try {
             md5 = md5(jar);
@@ -321,9 +389,12 @@ public final class GameJarPatcher {
 
         if (marker.isFile()) {
             try {
+                // Content is "<md5> <revision>". Both must match, so a jar
+                // patched by different patch code is always re-patched (the old
+                // format stored the bare md5, so any pre-r21 marker re-patches).
                 final String prev = readText(marker).trim();
-                if (prev.equals(md5)) {
-                    return new Result(false, "already patched");
+                if (prev.equals(md5 + " " + rev)) {
+                    return new Result(false, "already patched (" + rev + ")");
                 }
             } catch (Exception ignored) {}
         }
@@ -346,7 +417,7 @@ public final class GameJarPatcher {
             }
 
             markerDir.mkdirs();
-            writeText(marker, patchedMd5);
+            writeText(marker, patchedMd5 + " " + rev);
 
             final StringBuilder msg = new StringBuilder();
             if ((patched & PATCHED_GLESMESH) != 0) {
@@ -873,8 +944,8 @@ public final class GameJarPatcher {
                             // right above is 0..w (no such factor), so the
                             // scissor must not have it either: keep the PS1
                             // width at 320.
-                            if(opcode == Opcodes.SIPUSH && operand == 368) {
-                                super.visitIntInsn(opcode, 320);
+                            if(opcode == Opcodes.SIPUSH && operand == EXPECTED_WIDTH_FROM) {
+                                super.visitIntInsn(opcode, EXPECTED_WIDTH_TO);
                             } else {
                                 super.visitIntInsn(opcode, operand);
                             }
