@@ -244,9 +244,8 @@ public class TouchGamepadView extends View {
         mButtons.add(new Button("L2", mMargin + mButtonSize, trigY, mButtonSize * 1.5f, mButtonSize * 0.9f, 8, -1, 4, "left"));
         mButtons.add(new Button("R2", mWidth - mMargin - mButtonSize, trigY, mButtonSize * 1.5f, mButtonSize * 0.9f, 10, -1, 5, "right"));
 
-        float stickY = trigY + mButtonSize * 1.1f;
-        mButtons.add(new Button("L3", mMargin + mButtonSize, stickY, mButtonSize * 1.5f, mButtonSize * 0.9f, 45, 7, -1, "left"));
-        mButtons.add(new Button("R3", mWidth - mMargin - mButtonSize, stickY, mButtonSize * 1.5f, mButtonSize * 0.9f, 31, 8, -1, "right"));
+        // No L3/R3: the stick clicks are redundant on a touch pad (the stick
+        // itself is a touch area) and they crowded the shoulder column.
 
         applySavedLayout();
     }
@@ -632,11 +631,14 @@ public class TouchGamepadView extends View {
 
     private void sendKeyEvent(int keyCode, boolean down) {
         JVMRunner.queueKeyEvent(keyCode, down);
-        int sdlKey = toSdlKeyCode(keyCode);
-        if (sdlKey == 0) return;
+        // SDLActivity.onNativeKeyDown/Up take an ANDROID keycode (that is what
+        // SDL's own Android layer feeds them) and map it to an SDL key
+        // internally. Handing them a pre-converted SDL keycode made the game
+        // receive an unusable keycode and drop the event ("Unknown key" in the
+        // game log), so the keyboard mirror of the pad was dead.
         try {
-            if (down) git.mojo.sdl.SDLActivity.onNativeKeyDown(sdlKey);
-            else git.mojo.sdl.SDLActivity.onNativeKeyUp(sdlKey);
+            if (down) git.mojo.sdl.SDLActivity.onNativeKeyDown(keyCode);
+            else git.mojo.sdl.SDLActivity.onNativeKeyUp(keyCode);
         } catch (UnsatisfiedLinkError | NoClassDefFoundError e) {
             Log.w(TAG, "SDL native not ready, key dropped: " + keyCode);
         }
@@ -711,7 +713,13 @@ public class TouchGamepadView extends View {
     /**
      * Android keycode -> SDL3 keycode. Arrows/space/enter/digits use SDL's
      * special/ASCII values; letters map A-Z (29-54) to a-z (97-122).
+     *
+     * @deprecated only kept for reference: {@code SDLActivity.onNativeKeyDown}
+     * takes an ANDROID keycode and maps it to an SDL key itself, so callers
+     * must NOT pre-convert. Converting here handed the game a keycode it
+     * could not resolve and it dropped every key event.
      */
+    @Deprecated
     public static int toSdlKeyCode(int androidKey) {
         switch (androidKey) {
             case 19: return 0x40000052; // DPAD_UP -> SDLK_UP

@@ -198,11 +198,11 @@ public class SCPhysicalGamepad {
     }
 
     private static void sendSdlKey(int androidKey, boolean down) {
-        int sdlKey = TouchGamepadView.toSdlKeyCode(androidKey);
-        if (sdlKey == 0) return;
+        // SDLActivity.onNativeKeyDown/Up take an ANDROID keycode and do the
+        // SDL key mapping themselves.
         try {
-            if (down) git.mojo.sdl.SDLActivity.onNativeKeyDown(sdlKey);
-            else git.mojo.sdl.SDLActivity.onNativeKeyUp(sdlKey);
+            if (down) git.mojo.sdl.SDLActivity.onNativeKeyDown(androidKey);
+            else git.mojo.sdl.SDLActivity.onNativeKeyUp(androidKey);
         } catch (UnsatisfiedLinkError | NoClassDefFoundError ex) {
             Log.w(TAG, "SDL native not ready, key dropped: " + androidKey);
         }

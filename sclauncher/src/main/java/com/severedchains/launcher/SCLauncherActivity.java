@@ -718,33 +718,46 @@ public class SCLauncherActivity extends AppCompatActivity {
     // ------------------------------------------------------------------
     private void extractSclauncherNatives() {
         File nativesDir = new File(gameDir, "libs_natives");
-        File marker = new File(nativesDir, ".extracted_v6");
+        // The marker carries the LAUNCHER's versionCode, not a hand-bumped
+        // revision: the natives are re-extracted whenever the launcher build
+        // changes, so an in-place APK update can never leave stale natives
+        // behind. That used to be the reason the README demanded an uninstall
+        // before every update -- but an uninstall wipes the whole app data
+        // dir, including the unpacked game assets, so the next launch had to
+        // re-rip all 46 files from the discs (144 s on an S20, during which the
+        // game sits frozen and ignores input). With this marker, installing
+        // over the top is safe and the rip happens only once.
+        final String stamp = ".extracted_" + launcherVersionCode();
+        File marker = new File(nativesDir, stamp);
         if (marker.exists()) {
             ensureMobileControlsJar();
             return;
         }
-        // v5 -> v6: complete monolithic libopus.so (opus 1.6.1 full API:
-        // 24-bit + custom + DRED + projection, opusfile, libopusenc). The v5
-        // monolith (opus 1.5.2, custom/DRED off, no opusenc) still died in
-        // Opus$Functions.<clinit> (opus_encode24 missing) during unpack.
-        for (String old : new String[]{".extracted", ".extracted_v2", ".extracted_v3", ".extracted_v4", ".extracted_v5"}) {
-            File oldMarker = new File(nativesDir, old);
-            if (oldMarker.exists()) {
-                LogFile.log("Upgrading natives to v6, wiping libs_natives/");
-                deleteRecursive(nativesDir);
-                break;
-            }
+        // Any other marker means natives from an older launcher build.
+        final File[] oldMarkers = nativesDir.listFiles((d, name) -> name.startsWith(".extracted"));
+        if (oldMarkers != null && oldMarkers.length > 0) {
+            LogFile.log("Launcher build changed, refreshing natives in libs_natives/");
+            deleteRecursive(nativesDir);
         }
         try {
             nativesDir.mkdirs();
             extractAssetsDir("sclauncher_natives", nativesDir);
             marker.createNewFile();
-            LogFile.log("SCLauncher natives extracted (" + targetAbiName() + ") to "
-                    + nativesDir.getAbsolutePath());
+            LogFile.log("SCLauncher natives extracted (" + targetAbiName() + ", build "
+                    + launcherVersionCode() + ") to " + nativesDir.getAbsolutePath());
         } catch (Exception e) {
             LogFile.error("Failed to extract SCLauncher natives", e);
         }
         ensureMobileControlsJar();
+    }
+
+    /** The launcher's own versionCode; used to stamp the natives marker. */
+    private int launcherVersionCode() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionCode;
+        } catch (Exception e) {
+            return 0;
+        }
     }
 
     /**

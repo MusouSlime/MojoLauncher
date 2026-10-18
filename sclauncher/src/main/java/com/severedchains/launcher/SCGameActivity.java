@@ -858,7 +858,7 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
                 return true;
             }
             if (kc == android.view.KeyEvent.KEYCODE_ENTER) {
-                sendSdlKey(13);
+                sendSdlKey(android.view.KeyEvent.KEYCODE_ENTER);
                 return true;
             }
             int unicode = e.getUnicodeChar();
@@ -866,8 +866,7 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
                 commitSdlText(new String(Character.toChars(unicode)));
                 return true;
             }
-            int sdl = com.severedchains.launcher.ui.TouchGamepadView.toSdlKeyCode(kc);
-            if (sdl != 0) sendSdlKeyDown(sdl);
+            sendSdlKeyDown(kc);
             return true;
         }
         if (action == android.view.KeyEvent.ACTION_UP) {
@@ -876,8 +875,7 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
                 return true;
             }
             if (e.getUnicodeChar() >= 32) return true;
-            int sdl = com.severedchains.launcher.ui.TouchGamepadView.toSdlKeyCode(kc);
-            if (sdl != 0) sendSdlKeyUp(sdl);
+            sendSdlKeyUp(kc);
             return true;
         }
         return action == android.view.KeyEvent.ACTION_MULTIPLE;
@@ -1082,24 +1080,34 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
         } catch (UnsatisfiedLinkError | NoClassDefFoundError ignored) {}
     }
 
-    private void sendSdlKey(int sdlKey) {
+    /**
+     * Sends a key to the game.
+     *
+     * <p>NOTE: {@code SDLActivity.onNativeKeyDown/Up} take an <b>Android</b>
+     * keycode — that is what SDL's own Android layer passes
+     * ({@code onNativeKeyDown(event.getKeyCode())}) and the native side maps it
+     * to an SDL key/scancode itself. Passing a pre-converted SDL keycode made
+     * the game receive nonsense keycodes and drop every one of them ("Unknown
+     * key" in the game log, 203 of them in one session).
+     */
+    private void sendSdlKey(int androidKey) {
         try {
-            SDLActivity.onNativeKeyDown(sdlKey);
-            SDLActivity.onNativeKeyUp(sdlKey);
+            SDLActivity.onNativeKeyDown(androidKey);
+            SDLActivity.onNativeKeyUp(androidKey);
         } catch (UnsatisfiedLinkError | NoClassDefFoundError e) {
-            Log.w(TAG, "SDL native not ready, key dropped: " + sdlKey);
+            Log.w(TAG, "SDL native not ready, key dropped: " + androidKey);
         }
     }
 
-    private void sendSdlKeyUp(int sdlKey) {
+    private void sendSdlKeyUp(int androidKey) {
         try {
-            SDLActivity.onNativeKeyUp(sdlKey);
+            SDLActivity.onNativeKeyUp(androidKey);
         } catch (UnsatisfiedLinkError | NoClassDefFoundError ignored) {}
     }
 
-    private void sendSdlKeyDown(int sdlKey) {
+    private void sendSdlKeyDown(int androidKey) {
         try {
-            SDLActivity.onNativeKeyDown(sdlKey);
+            SDLActivity.onNativeKeyDown(androidKey);
         } catch (UnsatisfiedLinkError | NoClassDefFoundError ignored) {}
     }
 

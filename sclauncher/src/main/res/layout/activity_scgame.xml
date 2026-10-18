@@ -51,14 +51,14 @@
         android:text="KB"
         android:textSize="16sp" />
 
-    <!-- Return to the launcher. Bottom-left corner, next to the eye toggle.
+    <!-- Return to the launcher. Bottom-right corner, next to the eye toggle.
          Hidden in Handheld Mode (single BACK exits). -->
     <Button
         android:id="@+id/exitButton"
         android:layout_width="wrap_content"
         android:layout_height="40dp"
-        android:layout_gravity="bottom|start"
-        android:layout_marginStart="8dp"
+        android:layout_gravity="bottom|end"
+        android:layout_marginEnd="8dp"
         android:layout_marginBottom="12dp"
         android:alpha="0.6"
         android:minWidth="72dp"
@@ -73,8 +73,8 @@
         android:id="@+id/eyeButton"
         android:layout_width="40dp"
         android:layout_height="40dp"
-        android:layout_gravity="bottom|start"
-        android:layout_marginStart="88dp"
+        android:layout_gravity="bottom|end"
+        android:layout_marginEnd="88dp"
         android:layout_marginBottom="12dp"
         android:alpha="0.6"
         android:background="?android:attr/selectableItemBackgroundBorderless"
