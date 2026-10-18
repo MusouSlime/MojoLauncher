@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Legend of Dragoon primary action (Launch): gold panel, bright border. -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_enabled="false">
+        <shape android:shape="rectangle">
+            <solid android:color="#2A2A24" />
+            <stroke android:width="2dp" android:color="#555555" />
+            <corners android:radius="6dp" />
+        </shape>
+    </item>
+    <item android:state_pressed="true">
+        <shape android:shape="rectangle">
+            <solid android:color="#F0CE84" />
+            <stroke android:width="2dp" android:color="#FFF7E4" />
+            <corners android:radius="6dp" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#C9A24E" />
+            <stroke android:width="2dp" android:color="#F3E7C9" />
+            <corners android:radius="6dp" />
+        </shape>
+    </item>
+</selector>

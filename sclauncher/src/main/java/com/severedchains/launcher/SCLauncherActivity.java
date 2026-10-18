@@ -6,16 +6,19 @@ import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.util.Log;
 import android.view.View;
 import android.widget.Button;
+import android.widget.PopupMenu;
 import android.widget.ProgressBar;
 import android.widget.Switch;
 import android.widget.TextView;
@@ -29,6 +32,8 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
 import org.tukaani.xz.XZInputStream;
+
+import com.severedchains.launcher.utils.GpuDetectUtils;
 
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
@@ -86,36 +91,80 @@ public class SCLauncherActivity extends AppCompatActivity {
 
     public static final String MAIN_JAR_NAME = "lod-game-snapshot.jar";
 
+    // ------------------------------------------------------------------
+    // ABI selection: one APK per architecture (arm64 or x86_64 test build).
+    // The native asset set, JRE and ffmpeg jar are picked at runtime from the
+    // process ABI so a single code path serves both.
+    // ------------------------------------------------------------------
+    private static final String FFMPEG_ANDROID_X86_64_FILE = "ffmpeg-8.0.1-1.5.13-android-x86_64.jar";
+
+    /** True when this process is the x86_64 test build. */
+    public static boolean isX86_64() {
+        String arch = System.getProperty("os.arch");
+        if (arch == null) {
+            return false;
+        }
+        arch = arch.toLowerCase(java.util.Locale.US);
+        return arch.contains("x86_64") || arch.contains("amd64");
+    }
+
+    private static String targetAbiName() {
+        return isX86_64() ? "x86_64" : "arm64-v8a";
+    }
+
+    private static String jreArchiveName() {
+        return isX86_64() ? JRE_X86_64_FILE : JRE_ARM64_FILE;
+    }
+
+    private static String localJreAsset() {
+        return "jre/" + jreArchiveName();
+    }
+
+    private static String ffmpegAndroidFile() {
+        return isX86_64() ? FFMPEG_ANDROID_X86_64_FILE : FFMPEG_ANDROID_FILE;
+    }
+
+    /** bytedeco stages Android libs under lib/<abi>/ inside the jar. */
+    private static String ffmpegLibPrefix() {
+        return isX86_64() ? "lib/x86_64/" : "lib/arm64-v8a/";
+    }
+
     private ProgressBar progressBar;
     private TextView statusText;
     private TextView jreStatusText;
     private TextView downloadStatusText;
     private Button launchButton;
-    private Button searchAgainButton;
-    private Button sendLogButton;
-    private Button downloadJreButton;
-    private Button importJreButton;
-    private Button exportSavesButton;
-    private Button importSavesButton;
-    private Button snapdragonButton;
-    private Button maliButton;
-    private Button maliDebugButton;
-    private Button maliFixButton;
+    private Button menuButton;
     private TextView gpuModeText;
 
-    // RG406H comparison test: Snapdragon = stock shaders, Mali-A = patched
-    // tmd.gsh (near-plane cull off), Mali-B = cull-off gsh + tmd.fsh that
-    // visualizes the per-triangle flags (green=textured, red=untextured,
-    // blue=translucent), Mali-C = Mali-B with the emit() helper unrolled
-    // (constant GS input indices only — no dynamic vs_out[i]/gl_in[i]).
-    // Sticky; auto-defaults by GPU renderer
-    // (Adreno -> Snapdragon, Mali/unknown -> Mali-A).
+    // Renderer choice is AUTOMATIC (no manual buttons since 2026-09-17):
+    // all GPUs -> "snapdragon" (native system GLES). Legacy Zink is
+    // DISABLED (crashes Mali drivers: missing Zink Vulkan features);
+    // ANGLE is gone (EGL_BAD_ATTRIBUTE on T820). Mali HARDWARE still gets
+    // the DEBUG probe gsh via isMali(). Retired values ("mali", "malivk",
+    // "vulkan_zink", "opengles2", "mali"/"malib"/"malic" shader variants)
+    // migrate to the auto-selected mode on load.
     public static final String GPU_MODE_SNAPDRAGON = "snapdragon";
     public static final String GPU_MODE_MALI = "mali";
-    public static final String GPU_MODE_MALIB = "malib";
-    public static final String GPU_MODE_MALIC = "malic";
     private static final String PREFS_NAME = "sclauncher_prefs";
+
+    // App internal data folder: used by mods and file operations.
+    // Gets resolved to getFilesDir().getParent() + "/games/SCLauncher".
+    public static final String APP_DATA_DIR = "games/SCLauncher";
     private static final String PREF_GPU_MODE = "gpu_mode";
+    /** Handheld Mode: touch is always mouse; the game screen drops the
+     *  virtual-control/exit buttons and single BACK returns to the launcher. */
+    public static final String PREF_HANDHELD = "handheld_mode";
+    /** Show the launcher's Legend of Dragoon-themed on-screen pad
+     *  (TouchGamepadView). Default ON; the in-game mobile-controls mod is
+     *  always removed since the launcher pad is the controller now. */
+    public static final String PREF_TOUCH_PAD = "launcher_touch_pad";
+
+    /** Diagnostic probe: visualise the raw battle vertex position (inPos) as
+     *  colour, untextured. See applyGpuShaderVariant + gpu_variants/probe/. */
+    private static final boolean PROBE_BATTLE_POS = false;
+
+
     private String mGpuMode = GPU_MODE_SNAPDRAGON;
 
     private String dirData;
@@ -129,7 +178,6 @@ public class SCLauncherActivity extends AppCompatActivity {
     private static final String[] DISC_FILE_PATTERNS = {
             "disc1.bin", "disc2.bin", "disc3.bin", "disc4.bin"};
     private int mDiscTarget = 0;
-    private final Button[] mDiscButtons = new Button[4];
 
     private final ActivityResultLauncher<Intent> mPickFileLauncher = registerForActivityResult(
         new ActivityResultContracts.StartActivityForResult(),
@@ -147,6 +195,57 @@ public class SCLauncherActivity extends AppCompatActivity {
                         && mDiscTarget < DISC_FILE_PATTERNS.length) {
                     copyDiscImage(uri, DISC_FILE_PATTERNS[mDiscTarget]);
                 }
+            }
+        }
+    );
+
+    // Unpacked-data import: the ISO rip (Unpacker) is CPU- and I/O-heavy and
+    // crawls on low-end hardware. The user picks a pre-ripped `files/` tree
+    // (produced once on a faster device/PC that ran Severed Chains to
+    // completion) and it is copied into gameDir/files/. The game then sees a
+    // matching `files/version` and skips the rip entirely. isos/ (still needed
+    // for the game's quick disc check) and saves/ are untouched.
+    private final ActivityResultLauncher<Uri> mPickUnpackedLauncher = registerForActivityResult(
+        new ActivityResultContracts.OpenDocumentTree(),
+        uri -> {
+            if (uri != null) {
+                importUnpackedFiles(uri);
+            }
+        }
+    );
+
+    // Mod install: mods live in gameDir/mods/ (the game's mod-loader scans that
+    // folder for *.jar). Three entry points, all landing in mods/:
+    //  - Import Mod Jar…    : a single .jar, copied to mods/<name>.jar
+    //  - Import Mod Zip…    : a zipped mod, unzipped into mods/ in place
+    //  - Import Mod Folder… : an unzipped mod's contents, copied into mods/
+    //    recursively (the jar plus any folder it ships).
+    private final ActivityResultLauncher<String> mImportModJarLauncher = registerForActivityResult(
+        new ActivityResultContracts.GetContent(),
+        uri -> {
+            if (uri != null) {
+                importModJar(uri);
+            }
+        }
+    );
+
+    // Mod zips are usually application/zip, but some file managers hand them
+    // over as octet-stream, so accept all three spellings and filter by
+    // extension in code.
+    private final ActivityResultLauncher<String[]> mImportModZipLauncher = registerForActivityResult(
+            new ActivityResultContracts.OpenDocument(),
+            uri -> {
+                if (uri != null) {
+                    importModZip(uri);
+                }
+            }
+    );
+
+    private final ActivityResultLauncher<Uri> mImportModsFolderLauncher = registerForActivityResult(
+        new ActivityResultContracts.OpenDocumentTree(),
+        uri -> {
+            if (uri != null) {
+                importModsFolder(uri);
             }
         }
     );
@@ -171,42 +270,11 @@ public class SCLauncherActivity extends AppCompatActivity {
         jreStatusText = findViewById(R.id.jreStatusText);
         downloadStatusText = findViewById(R.id.downloadStatusText);
         launchButton = findViewById(R.id.launchButton);
-        searchAgainButton = findViewById(R.id.searchAgainButton);
-        sendLogButton = findViewById(R.id.sendLogButton);
-        sendLogButton.setOnClickListener(v -> sendLastLog());
-        downloadJreButton = findViewById(R.id.downloadJreButton);
-        mDiscButtons[0] = findViewById(R.id.pickDisc1Button);
-        mDiscButtons[1] = findViewById(R.id.pickDisc2Button);
-        mDiscButtons[2] = findViewById(R.id.pickDisc3Button);
-        mDiscButtons[3] = findViewById(R.id.pickDisc4Button);
-        importJreButton = findViewById(R.id.importJreButton);
-        exportSavesButton = findViewById(R.id.exportSavesButton);
-        importSavesButton = findViewById(R.id.importSavesButton);
-        snapdragonButton = findViewById(R.id.snapdragonButton);
-        maliButton = findViewById(R.id.maliButton);
-        maliDebugButton = findViewById(R.id.maliDebugButton);
-        maliFixButton = findViewById(R.id.maliFixButton);
+        menuButton = findViewById(R.id.menuButton);
+        if (menuButton != null) {
+            menuButton.setOnClickListener(v -> showOptionsMenu());
+        }
         gpuModeText = findViewById(R.id.gpuModeText);
-        if (snapdragonButton != null) {
-            snapdragonButton.setOnClickListener(v -> setGpuMode(GPU_MODE_SNAPDRAGON));
-        }
-        if (maliButton != null) {
-            maliButton.setOnClickListener(v -> setGpuMode(GPU_MODE_MALI));
-        }
-        if (maliDebugButton != null) {
-            maliDebugButton.setOnClickListener(v -> setGpuMode(GPU_MODE_MALIB));
-        }
-        if (maliFixButton != null) {
-            maliFixButton.setOnClickListener(v -> setGpuMode(GPU_MODE_MALIC));
-        }
-
-        importJreButton.setOnClickListener(v -> importJreFromStorage());
-        exportSavesButton.setOnClickListener(v -> exportSaves());
-        importSavesButton.setOnClickListener(v -> pickSavesArchive());
-        for (int i = 0; i < 4; i++) {
-            final int index = i;
-            mDiscButtons[i].setOnClickListener(v -> pickDiscImage(index));
-        }
 
         dirData = getFilesDir().getParent();
         dirCache = getCacheDir().getAbsolutePath();
@@ -223,7 +291,18 @@ public class SCLauncherActivity extends AppCompatActivity {
         LogFile.log("SCLauncherActivity onCreate");
         LogFile.log("dirData=" + dirData + ", dirCache=" + dirCache + ", nativeLibDir=" + nativeLibDir);
         LogFile.log("gameDir=" + gameDir.getAbsolutePath());
+
+        // If the previous game session died hard (VM abort/SIGKILL), its clean
+        // export never ran — pull its logs into Downloads/Reports now.
+        SCLogExporter.exportCrashRecoveryIfNeeded(this, gameDir);
         SCGpuInfo.logOnce(this);
+        // Renderer evidence in every log: Vulkan hw feature, system
+        // libvulkan presence (informational; Zink is disabled).
+        try {
+            LogFile.log("Vulkan probe: " + SCVulkanProbe.summary(this).replace("\n", " | "));
+        } catch (Exception e) {
+            LogFile.error("Vulkan probe failed", e);
+        }
         // Low-end preflight (storage/RAM/GLES3): warn early with a plain
         // message instead of failing later with a confusing error.
         try {
@@ -239,8 +318,10 @@ public class SCLauncherActivity extends AppCompatActivity {
             LogFile.error("Preflight check failed", e);
         }
 
-        // GPU comparison mode: remembered choice wins, otherwise Adreno ->
-        // Snapdragon (stock), Mali/unknown -> Mali (cull-off fix).
+        // Renderer choice is automatic: all GPUs run native GLES (Zink
+        // disabled). The saved pref only fast-forwards the first
+        // auto-detect; stale values (mali, malivk, vulkan_zink, opengles2,
+        // retired shader variants) migrate with a log line.
         mGpuMode = loadGpuMode();
         updateGpuModeUI();
 
@@ -248,8 +329,6 @@ public class SCLauncherActivity extends AppCompatActivity {
         extractBundledGameFiles();
 
         launchButton.setOnClickListener(v -> launchGame());
-        searchAgainButton.setOnClickListener(v -> refreshAll());
-        downloadJreButton.setOnClickListener(v -> downloadJre25());
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) != PackageManager.PERMISSION_GRANTED) {
@@ -337,13 +416,191 @@ public class SCLauncherActivity extends AppCompatActivity {
         }).start();
     }
 
+    // ------------------------------------------------------------------
+    // Import unpacked data: copy a pre-ripped `files/` tree (the CPU-heavy
+    // output of the game's ISO Unpacker, produced once on a faster device/PC
+    // that ran Severed Chains to completion) into gameDir/files/. The game
+    // then sees a matching `files/version` and skips the rip entirely. The
+    // picked folder may be the `files/` folder itself or a parent containing
+    // it (e.g. a copied gameDir). isos/ (still needed for the game's quick
+    // disc check) and saves/ are untouched. Framework DocumentsContract only,
+    // no extra dependency.
+    // ------------------------------------------------------------------
+    private static class DocEntry {
+        String docId;
+        String name;
+        String mime;
+    }
+
+    private void importUnpackedFiles(Uri treeUri) {
+        try {
+            getContentResolver().takePersistableUriPermission(treeUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        } catch (Exception e) {
+            LogFile.log("Folder permission not persistable (one-shot copy): " + e.getMessage());
+        }
+        statusText.setText("Importing unpacked data...");
+        progressBar.setVisibility(View.VISIBLE);
+        launchButton.setEnabled(false);
+        LogFile.log("Importing unpacked data folder: " + treeUri);
+        SCActionTrail.record("Unpacked data import started");
+
+        new Thread(() -> {
+            try {
+                final String treeDocId = DocumentsContract.getTreeDocumentId(treeUri);
+
+                // Accept either the files/ folder itself or a parent (e.g. a
+                // copied gameDir) that contains a `files` child.
+                DocEntry root = new DocEntry();
+                root.docId = treeDocId;
+                root.name = "files";
+                root.mime = DocumentsContract.Document.MIME_TYPE_DIR;
+                for (DocEntry e : listTreeChildren(treeUri, treeDocId)) {
+                    if (DocumentsContract.Document.MIME_TYPE_DIR.equals(e.mime)
+                            && "files".equals(e.name)) {
+                        root = e;
+                        break;
+                    }
+                }
+
+                final List<DocEntry> rootChildren = listTreeChildren(treeUri, root.docId);
+                if (!looksLikeUnpack(rootChildren)) {
+                    throw new IOException("Folder doesn't look like unpacked Severed Chains data "
+                            + "(need a 'version' file and SECT/ etc.; saw: " + nameList(rootChildren) + ")");
+                }
+
+                final File dest = new File(gameDir, "files");
+                dest.mkdirs();
+                final int[] count = new int[]{0};
+                for (DocEntry e : rootChildren) {
+                    copyTreeEntry(treeUri, e, new File(dest, e.name), count);
+                    final int n = count[0];
+                    uiHandler.post(() -> statusText.setText("Importing unpacked data... " + n + " files"));
+                }
+
+                final String version = readImportedVersion(dest);
+                LogFile.log("Imported " + count[0] + " unpacked files into "
+                        + dest.getAbsolutePath() + " (unpack version " + version + ")");
+                SCActionTrail.record("Unpacked data import finished (" + count[0] + " files)");
+                final int total = count[0];
+                uiHandler.post(() -> {
+                    progressBar.setVisibility(View.GONE);
+                    statusText.setText("Unpacked data imported (v" + version + ").");
+                    Toast.makeText(this, "Imported " + total + " files (unpack v" + version + ")",
+                            Toast.LENGTH_LONG).show();
+                    refreshAll();
+                });
+            } catch (Exception e) {
+                LogFile.error("Failed to import unpacked data", e);
+                uiHandler.post(() -> {
+                    progressBar.setVisibility(View.GONE);
+                    statusText.setText("Import failed: " + e.getMessage());
+                    Toast.makeText(this, "Import failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                });
+            }
+        }).start();
+    }
+
+    /** True if the entries look like the game's unpacked `files/` tree
+     *  (a `version` marker file plus at least one known data directory). */
+    private static boolean looksLikeUnpack(List<DocEntry> children) {
+        boolean hasVersion = false, hasDir = false;
+        for (DocEntry e : children) {
+            boolean isDir = DocumentsContract.Document.MIME_TYPE_DIR.equals(e.mime);
+            if (!isDir && "version".equals(e.name)) hasVersion = true;
+            if (isDir && ("SECT".equals(e.name) || "characters".equals(e.name)
+                    || "monsters".equals(e.name) || "OVL".equals(e.name)
+                    || "SUBMAP".equals(e.name))) {
+                hasDir = true;
+            }
+        }
+        return hasVersion && hasDir;
+    }
+
+    private static String nameList(List<DocEntry> entries) {
+        StringBuilder names = new StringBuilder();
+        int shown = 0;
+        for (DocEntry e : entries) {
+            if (shown > 0) names.append(", ");
+            names.append(e.name);
+            if (++shown >= 12) {
+                names.append(", …");
+                break;
+            }
+        }
+        return names.toString();
+    }
+
+    /** Reads the game's unpack version marker from the imported files/ tree. */
+    private static String readImportedVersion(File filesDir) {
+        File version = new File(filesDir, "version");
+        try (BufferedReader r = new BufferedReader(new FileReader(version))) {
+            String line = r.readLine();
+            return line != null && !line.trim().isEmpty() ? line.trim() : "?";
+        } catch (Exception e) {
+            return "?";
+        }
+    }
+
+    private List<DocEntry> listTreeChildren(Uri treeUri, String parentDocId) {
+        List<DocEntry> out = new ArrayList<>();
+        Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId);
+        try (Cursor c = getContentResolver().query(childrenUri,
+                new String[]{
+                        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                        DocumentsContract.Document.COLUMN_MIME_TYPE},
+                null, null, null)) {
+            if (c == null) return out;
+            int idCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID);
+            int nameCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME);
+            int mimeCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE);
+            while (c.moveToNext()) {
+                DocEntry e = new DocEntry();
+                e.docId = c.getString(idCol);
+                e.name = c.getString(nameCol);
+                e.mime = c.getString(mimeCol);
+                // Never import a hostile name (../ escapes, absolute paths).
+                if (e.name == null || e.name.contains("..") || e.name.contains("/") || e.name.contains("\\")) {
+                    LogFile.log("Skipping unsafe entry: " + e.name);
+                    continue;
+                }
+                out.add(e);
+            }
+        }
+        return out;
+    }
+
+    private void copyTreeEntry(Uri treeUri, DocEntry entry, File dst, int[] count) throws IOException {
+        if (DocumentsContract.Document.MIME_TYPE_DIR.equals(entry.mime)) {
+            dst.mkdirs();
+            // Children resolve via the tree + this entry's document id.
+            for (DocEntry child : listTreeChildren(treeUri, entry.docId)) {
+                copyTreeEntry(treeUri, child, new File(dst, child.name), count);
+            }
+        } else {
+            Uri fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, entry.docId);
+            File parent = dst.getParentFile();
+            if (parent != null) parent.mkdirs();
+            try (InputStream in = getContentResolver().openInputStream(fileUri);
+                 OutputStream fileOut = new FileOutputStream(dst)) {
+                if (in == null) throw new IOException("Cannot open " + entry.name);
+                byte[] buf = new byte[65536];
+                int n;
+                while ((n = in.read(buf)) != -1) {
+                    fileOut.write(buf, 0, n);
+                }
+            }
+            count[0]++;
+        }
+    }
+
     /**
      * Saves live in shared storage where non-root users (and the player) can
      * reach them: <sdcard>/Android/data/<pkg>/files/Saves (USB/file manager,
      * no root). gameDir/saves is a symlink there so the game sees no change.
      * Existing save files are moved, never deleted.
-     */
-    private void setupSavesLink() {
+     */    private void setupSavesLink() {
         try {
             File extRoot = getExternalFilesDir(null);
             if (extRoot == null) {
@@ -383,6 +640,13 @@ public class SCLauncherActivity extends AppCompatActivity {
         }
     }
 
+    /**
+     * Refreshes the bundled game dir (bundle upgrade) while preserving the
+     * user's data: isos/ (disc images) and saves/ are copied out/back, and
+     * files/ (the game's slow ISO rip) is kept IN PLACE so a launcher-side
+     * update never forces a multi-GB re-rip. Only a game-side unpack VERSION
+     * bump makes the game rebuild files/ itself.
+     */
     private void preserveAndWipeGameDir() {
         File isos = new File(gameDir, "isos");
         File saves = new File(gameDir, "saves");
@@ -398,6 +662,10 @@ public class SCLauncherActivity extends AppCompatActivity {
         File[] children = gameDir.listFiles();
         if (children != null) {
             for (File child : children) {
+                // Keep the unpacked data in place: copying it through cache
+                // would need GBs and a slow move; deleting it would force a
+                // full re-rip on the next launch.
+                if ("files".equals(child.getName())) continue;
                 deleteRecursive(child);
             }
         }
@@ -452,6 +720,7 @@ public class SCLauncherActivity extends AppCompatActivity {
         File nativesDir = new File(gameDir, "libs_natives");
         File marker = new File(nativesDir, ".extracted_v6");
         if (marker.exists()) {
+            ensureMobileControlsJar();
             return;
         }
         // v5 -> v6: complete monolithic libopus.so (opus 1.6.1 full API:
@@ -470,9 +739,60 @@ public class SCLauncherActivity extends AppCompatActivity {
             nativesDir.mkdirs();
             extractAssetsDir("sclauncher_natives", nativesDir);
             marker.createNewFile();
-            LogFile.log("SCLauncher natives extracted to " + nativesDir.getAbsolutePath());
+            LogFile.log("SCLauncher natives extracted (" + targetAbiName() + ") to "
+                    + nativesDir.getAbsolutePath());
         } catch (Exception e) {
             LogFile.error("Failed to extract SCLauncher natives", e);
+        }
+        ensureMobileControlsJar();
+    }
+
+    /**
+     * In-game touch controls (legend.mobile.MobileControlsMod,
+     * {@code mobile-controls.jar}): REPLACES the launcher's touch overlay
+     * (see SCGameActivity). The mod is discovered by the game's ModManager
+     * via Reflections classpath scanning ({@code @Mod} annotation), so it
+     * only needs to sit in {@code gameDir/libs/} — which checkGameFiles()
+     * already puts on the classpath (no filter hits that name).
+     * Fresh installs get it via the bulk assets/game extract; existing
+     * installs (bundle marker v4, no re-extract) get it here — runs on
+     * every launch. The deployed copy is accepted only when its CONTENT
+     * matches the bundled jar (same-length-but-stale jars are replaced).
+     */
+    private void ensureMobileControlsJar() {
+        if (gameDir == null) return;
+        // The launcher's Legend of Dragoon-themed pad (TouchGamepadView) is the
+        // on-screen controller now, so the in-game MobileControlsMod is disabled
+        // by removing its jar: the two control layers must never draw or consume
+        // the same touches. Runs on every launch; a fresh bulk extract that
+        // re-places the jar is removed again here.
+        File dst = new File(new File(gameDir, "libs"), "mobile-controls.jar");
+        if (dst.exists() && dst.delete()) {
+            LogFile.log("Removed mobile-controls.jar (Dragoon pad is the controller)");
+            SCActionTrail.record("In-game controls mod disabled (Dragoon pad)");
+        }
+    }
+
+    private static byte[] md5(File f) throws IOException {
+        java.security.MessageDigest d;
+        try {
+            d = java.security.MessageDigest.getInstance("MD5");
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IOException(e);
+        }
+        try (InputStream in = new FileInputStream(f)) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) != -1) d.update(buf, 0, n);
+        }
+        return d.digest();
+    }
+
+    private static byte[] md5(byte[] data) {
+        try {
+            return java.security.MessageDigest.getInstance("MD5").digest(data);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            return null;
         }
     }
 
@@ -510,100 +830,85 @@ public class SCLauncherActivity extends AppCompatActivity {
     }
 
     // ------------------------------------------------------------------
-    // GPU comparison mode (RG406H test): Snapdragon runs stock shaders,
-    // Mali-A swaps in the cull-off tmd.gsh, Mali-B adds the flag-debug
-    // tmd.fsh, Mali-C keeps both with an unrolled emit (no dynamic index). The variants live in the tiny
-    // gameDir/gpu_variants/ dir (own marker, no game-bundle wipe); the
-    // selected tmd.gsh is copied over gameDir/gfx/shaders/ before launch.
+    // Renderer choice: automatic by GPU vendor (no manual buttons).
+    // All GPUs -> "snapdragon" (native system GLES; Zink disabled — it
+    // crashes Mali drivers). Mali HARDWARE still gets the DEBUG probe gsh
+    // via isMali() in applyGpuShaderVariant. Any stale saved value
+    // migrates to the auto-selected mode with a log line.
     // ------------------------------------------------------------------
     private String loadGpuMode() {
+        String saved = null;
         try {
             android.content.SharedPreferences p =
                     getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-            String saved = p.getString(PREF_GPU_MODE, null);
-            if (GPU_MODE_MALI.equals(saved) || GPU_MODE_SNAPDRAGON.equals(saved)
-                    || GPU_MODE_MALIB.equals(saved) || GPU_MODE_MALIC.equals(saved)) {
-                LogFile.log("GPU mode (saved): " + saved);
-                return saved;
-            }
+            saved = p.getString(PREF_GPU_MODE, null);
         } catch (Exception ignored) {}
-        String auto = detectGpuMode();
-        LogFile.log("GPU mode (auto by renderer): " + auto);
+        String selected = GpuDetectUtils.selectBestGpuMode(this, saved);
+        if (saved == null) {
+            LogFile.log("GPU mode (auto): " + selected);
+        } else if (!selected.equals(saved)) {
+            LogFile.log("GPU mode (saved " + saved + " -> auto " + selected + ")");
+        } else {
+            LogFile.log("GPU mode (saved): " + saved);
+        }
         try {
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                    .edit().putString(PREF_GPU_MODE, auto).apply();
+                    .edit().putString(PREF_GPU_MODE, selected).apply();
         } catch (Exception ignored) {}
-        return auto;
+        return selected;
     }
 
-    /** Adreno -> Snapdragon; Mali or anything unknown -> Mali (fix). */
+    /** Fresh-install default: pure auto-detect (flavor-independent). */
     private String detectGpuMode() {
-        try {
-            String summary = SCGpuInfo.summary();
-            if (summary != null) {
-                String low = summary.toLowerCase(java.util.Locale.US);
-                if (low.contains("adreno")) return GPU_MODE_SNAPDRAGON;
-                if (low.contains("mali")) return GPU_MODE_MALI;
-            }
-        } catch (Exception ignored) {}
-        return GPU_MODE_MALI;
-    }
-
-    private void setGpuMode(String mode) {
-        mGpuMode = mode;
-        try {
-            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                    .edit().putString(PREF_GPU_MODE, mode).apply();
-        } catch (Exception ignored) {}
-        LogFile.log("GPU mode selected: " + mode);
-        SCActionTrail.record("GPU mode selected: " + mode);
-        updateGpuModeUI();
-        applyGpuShaderVariant();
+        return GpuDetectUtils.selectBestGpuMode(this, null);
     }
 
     private void updateGpuModeUI() {
         if (gpuModeText != null) {
-            gpuModeText.setText(GPU_MODE_MALIC.equals(mGpuMode)
-                    ? "GPU: Mali-C (unrolled emit)"
-                    : GPU_MODE_MALIB.equals(mGpuMode)
-                    ? "GPU: Mali-B (flag debug)"
-                    : GPU_MODE_MALI.equals(mGpuMode)
-                    ? "GPU: Mali-A (cull-off fix)"
-                    : "GPU: Snapdragon (stock shaders)");
-        }
-        if (maliButton != null) {
-            maliButton.setText(GPU_MODE_MALI.equals(mGpuMode) ? "Mali-A ✓" : "Mali-A");
-        }
-        if (maliDebugButton != null) {
-            maliDebugButton.setText(GPU_MODE_MALIB.equals(mGpuMode) ? "Mali-B dbg ✓" : "Mali-B dbg");
-        }
-        if (maliFixButton != null) {
-            maliFixButton.setText(GPU_MODE_MALIC.equals(mGpuMode) ? "Mali-C ✓" : "Mali-C");
-        }
-        if (snapdragonButton != null) {
-            snapdragonButton.setText(GPU_MODE_SNAPDRAGON.equals(mGpuMode) ? "Snap ✓" : "Snap");
+            String text;
+            if (GPU_MODE_MALI.equals(mGpuMode)) {
+                text = "GPU: Mali (native GLES + PLAIN probe, auto)";
+            } else if (GPU_MODE_SNAPDRAGON.equals(mGpuMode)) {
+                // Mali hardware reports snapdragon mode (wrappers removed)
+                // but still gets the Mali probe shader — surface the
+                // HARDWARE truth here, never the mode string alone.
+                text = GpuDetectUtils.isMali(this)
+                        ? "GPU: Mali (native GLES + PLAIN probe, auto)"
+                        : "GPU: Snapdragon (native GLES, auto)";
+            } else {
+                text = "GPU: " + mGpuMode;
+            }
+            gpuModeText.setText(text);
         }
     }
 
-    /** Extracts the shader-variant dir once (stock + mali/malib files). */
+    /** Extracts the stock-shader dir once (repairs debug-overwritten files). */
     private void extractGpuVariants() {
         try {
             File variantsDir = new File(gameDir, "gpu_variants");
-            File marker = new File(variantsDir, ".gpu_variant_v3");
+            File marker = new File(variantsDir, ".gpu_variant_v13");
             if (marker.exists()
-                    && new File(variantsDir, "mali/tmd.gsh").exists()
-                    && new File(variantsDir, "malib/tmd.gsh").exists()
-                    && new File(variantsDir, "malib/tmd.fsh").exists()
-                    && new File(variantsDir, "malic/tmd.gsh").exists()
-                    && new File(variantsDir, "malic/tmd.fsh").exists()
                     && new File(variantsDir, "stock/tmd.gsh").exists()
-                    && new File(variantsDir, "stock/tmd.fsh").exists()) {
+                    && new File(variantsDir, "stock/tmd.fsh").exists()
+                    && new File(variantsDir, "stock/tmd.vsh").exists()
+                    && new File(variantsDir, "stock/battle_tmd.vsh").exists()
+                    && new File(variantsDir, "stock/battle_tmd.fsh").exists()
+                    && new File(variantsDir, "fixed/tmd.gsh").exists()
+                    && new File(variantsDir, "plain/tmd.gsh").exists()
+                    && new File(variantsDir, "plain/tmd.vsh").exists()
+                    && new File(variantsDir, "plain/tmd.fsh").exists()
+                    && new File(variantsDir, "plain/battle_tmd.vsh").exists()
+                    && new File(variantsDir, "plain/battle_tmd.fsh").exists()) {
                 return;
             }
-            // v2 -> v3: added malic (unrolled-emit gsh + flag-debug fsh). All variants ship
-            // IN the APK (stock/ = pristine bytes), so a stale dir is
+// v11: stock/ tmd.gsh reverted to PRISTINE (the Mali-only tpageOverride
+// keep-alive was removed from stock — it shipped on every GPU including
+// Adreno). v10 was the PLAIN-varyings probe in plain/. Wipe + re-extract so
+// devices holding the old cached stock/ shader heal on next launch.
+            // The v8 FIXED shader is backed up at Backups/tmd.fixed.gsh.v1.
+            // Stock bytes ship IN the APK (pristine), so a stale dir is
             // simply wiped — never snapshotted from gameDir (which may
-            // already hold a Mali file from a previous run).
+            // already hold a debug file from a previous run).
             deleteRecursive(variantsDir);
             variantsDir.mkdirs();
             extractAssetsDir("gpu_variants", variantsDir);
@@ -616,35 +921,104 @@ public class SCLauncherActivity extends AppCompatActivity {
     }
 
     /**
-     * Copies the selected shaders over gameDir/gfx/shaders/.
-     * Called on every launch so the mode switch never needs a reinstall.
+     * Applies the per-launch TMD shaders over gameDir/gfx/shaders/.
+     * Mali GPUs run the PLAIN probe (scalar varyings + recovered-z cull,
+     * real varyings; 5 files: tmd vsh/gsh/fsh + battle vsh/fsh); everything
+     * else runs STOCK (same 5 files restored, heals debug-overwritten
+     * devices). Keyed off hardware ({@code isMali}), not the mode string.
+     * Called on every launch.
      */
     private void applyGpuShaderVariant() {
         if (gameDir == null) return;
         try {
-            String variant = GPU_MODE_MALIC.equals(mGpuMode) ? "malic"
-                    : GPU_MODE_MALIB.equals(mGpuMode) ? "malib"
-                    : GPU_MODE_MALI.equals(mGpuMode) ? "mali" : "stock";
-            File gshSrc = new File(gameDir, "gpu_variants/" + variant + "/tmd.gsh");
-            File fshSrc = new File(gameDir, "gpu_variants/" + variant + "/tmd.fsh");
+            boolean mali = GpuDetectUtils.isMali(this);
+            File variants = new File(gameDir, "gpu_variants");
+            File plainDir = new File(variants, "plain");
+            // All five plain files must be present or we fall back to the
+            // previous behaviour (fixed gsh + stock fsh) / stock.
+            boolean plainReady = new File(plainDir, "tmd.vsh").exists()
+                    && new File(plainDir, "tmd.gsh").exists()
+                    && new File(plainDir, "tmd.fsh").exists()
+                    && new File(plainDir, "battle_tmd.vsh").exists()
+                    && new File(plainDir, "battle_tmd.fsh").exists();
+            // Mali only. The scalar-varyings (plain) TMD shaders FAIL TO LINK on
+            // Adreno ("Use is before Def" from the shader compiler) — applying
+            // them on Snapdragon/Adreno leaves all uniforms missing and the game
+            // crashes with "Failed to create texture, glError: 502". So they must
+            // stay hardware-gated.
+            boolean plain = mali && plainReady;
+            boolean uvProbe = new File(gameDir, "gpu_variants/debug_uvprobe/tmd.gsh").exists();
+            String mode;
+            if (plain) {
+                copyFile(new File(plainDir, "tmd.vsh"),
+                        new File(gameDir, "gfx/shaders/tmd.vsh"));
+                copyFile(new File(plainDir, "tmd.gsh"),
+                        new File(gameDir, "gfx/shaders/tmd.gsh"));
+                copyFile(new File(plainDir, "tmd.fsh"),
+                        new File(gameDir, "gfx/shaders/tmd.fsh"));
+                copyFile(new File(plainDir, "battle_tmd.vsh"),
+                        new File(gameDir, "gfx/shaders/battle_tmd.vsh"));
+                copyFile(new File(plainDir, "battle_tmd.fsh"),
+                        new File(gameDir, "gfx/shaders/battle_tmd.fsh"));
+                mode = "PLAIN varyings probe";
+            } else if (mali && uvProbe) {
+                // Mali-only: the UV/FLAG debug probe must never run on
+                // Snapdragon (it tinted non-Mali models blue). Gated on
+                // hardware so non-Mali always falls through to stock.
+                File gshSrc = new File(gameDir, "gpu_variants/debug_uvprobe/tmd.gsh");
+                if (gshSrc.exists()) {
+                    copyFile(gshSrc, new File(gameDir, "gfx/shaders/tmd.gsh"));
+                }
+                mode = "UV/FLAG probe";
+            } else if (mali) {
+                File gshSrc = new File(gameDir, "gpu_variants/fixed/tmd.gsh");
+                if (gshSrc.exists()) {
+                    copyFile(gshSrc, new File(gameDir, "gfx/shaders/tmd.gsh"));
+                }
+                File fshSrc = new File(gameDir, "gpu_variants/stock/tmd.fsh");
+                if (fshSrc.exists()) {
+                    copyFile(fshSrc, new File(gameDir, "gfx/shaders/tmd.fsh"));
+                }
+                mode = "WHITEOUT color probe";
+            } else {
+                // Non-Mali: restore all five stock files (heals probes).
+                String[][] pairs = {
+                        {"stock/tmd.vsh", "gfx/shaders/tmd.vsh"},
+                        {"stock/tmd.gsh", "gfx/shaders/tmd.gsh"},
+                        {"stock/tmd.fsh", "gfx/shaders/tmd.fsh"},
+                        {"stock/battle_tmd.vsh", "gfx/shaders/battle_tmd.vsh"},
+                        {"stock/battle_tmd.fsh", "gfx/shaders/battle_tmd.fsh"},
+                };
+                for (String[] p : pairs) {
+                    File src = new File(variants, p[0]);
+                    if (src.exists()) copyFile(src, new File(gameDir, p[1]));
+                }
+                mode = "stock";
+                // PROBE: visualise the raw battle vertex position (inPos) as
+                // colour, untextured (see gpu_variants/probe/battle_tmd.*).
+                if (PROBE_BATTLE_POS) {
+                    File pvsh = new File(variants, "probe/battle_tmd.vsh");
+                    File pfsh = new File(variants, "probe/battle_tmd.fsh");
+                    if (pvsh.exists() && pfsh.exists()) {
+                        copyFile(pvsh, new File(gameDir, "gfx/shaders/battle_tmd.vsh"));
+                        copyFile(pfsh, new File(gameDir, "gfx/shaders/battle_tmd.fsh"));
+                        mode = "stock + battle position probe";
+                    }
+                }
+            }
             File gshDst = new File(gameDir, "gfx/shaders/tmd.gsh");
             File fshDst = new File(gameDir, "gfx/shaders/tmd.fsh");
-            // Stock/mali variants ship only tmd.gsh; malib AND malic add the
-            // flag-debug tmd.fsh (identical logic — only the gsh differs, so
-            // Mali-B vs Mali-C isolates the emit unroll).
-            // A missing file means "keep current" (e.g. v1 installs).
-            if (gshSrc.exists()) {
-                copyFile(gshSrc, gshDst);
+            // Hardware truth in the prefix: the mode string is "snapdragon"
+            // on every GPU (wrappers removed), which misled testers on Mali
+            // hardware into thinking the Mali probe never ran.
+            String hwPrefix;
+            try {
+                hwPrefix = GpuDetectUtils.isMali(this) ? "MALI" : "SNAPDRAGON";
+            } catch (Throwable t) {
+                hwPrefix = mGpuMode.toUpperCase();
             }
-            // Debug modes replace the fragment shader; every other mode
-            // restores stock fsh (a previous debug run overwrote it).
-            if (GPU_MODE_MALIB.equals(mGpuMode) || GPU_MODE_MALIC.equals(mGpuMode)) {
-                if (fshSrc.exists()) copyFile(fshSrc, fshDst);
-            } else {
-                File stockFsh = new File(gameDir, "gpu_variants/stock/tmd.fsh");
-                if (stockFsh.exists()) copyFile(stockFsh, fshDst);
-            }
-            LogFile.log("GPU shaders applied: " + mGpuMode.toUpperCase()
+            LogFile.log("GPU shaders applied: " + hwPrefix
+                    + " (" + mode + ")"
                     + " tmd.gsh (" + gshDst.length() + "b)"
                     + " tmd.fsh (" + fshDst.length() + "b)");
         } catch (Exception e) {
@@ -663,24 +1037,598 @@ public class SCLauncherActivity extends AppCompatActivity {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Options dropdown: every launcher action except Launch lives here,
+    // rebuilt fresh on each open so disc ✓ states and the JRE-download
+    // entry are always current.
+    // ------------------------------------------------------------------
+    private void showOptionsMenu() {
+        if (menuButton == null) return;
+        PopupMenu menu = new PopupMenu(this, menuButton);
+        int order = 0;
+        menu.getMenu().add(0, 1, order++, "Search Again");
+        menu.getMenu().add(0, 2, order++, "Import Unpacked Data (files/)…");
+        menu.getMenu().add(0, 3, order++, "Send Log");
+        if (foundJreName == null) {
+            menu.getMenu().add(0, 4, order++, "Download JRE 25");
+        }
+        menu.getMenu().add(0, 5, order++, "Import JRE…");
+        menu.getMenu().add(0, 6, order++, "Disc Status…");
+        for (int i = 0; i < DISC_FILE_PATTERNS.length; i++) {
+            menu.getMenu().add(0, 10 + i, order++, discLabel(i));
+        }
+        menu.getMenu().add(0, 20, order++, "Export Saves");
+        menu.getMenu().add(0, 21, order++, "Import Saves");
+        menu.getMenu().add(0, 30, order++, "Import Mod Jar…");
+        menu.getMenu().add(0, 35, order++, "Import Mod Zip…");
+        menu.getMenu().add(0, 34, order++, "Import Mod Folder…");
+        menu.getMenu().add(0, 31, order++, "App Folder (mods)…");
+        menu.getMenu().add(0, 40, order++, loadHandheldMode() ? "Handheld Mode ✓" : "Handheld Mode");
+        menu.getMenu().add(0, 41, order++, loadTouchPad() ? "Dragoon Pad ✓" : "Dragoon Pad");
+        menu.getMenu().add(0, 42, order++, "Touch Pad Opacity…");
+        menu.getMenu().add(0, 43, order++, "Reset Controls");
+        menu.setOnMenuItemClickListener(item -> {
+            int id = item.getItemId();
+            if (id == 1) {
+                refreshAll();
+                return true;
+            } else if (id == 2) {
+                mPickUnpackedLauncher.launch(null);
+                return true;
+            } else if (id == 3) {
+                sendLastLog();
+                return true;
+            } else if (id == 4) {
+                downloadJre25();
+                return true;
+            } else if (id == 5) {
+                importJreFromStorage();
+                return true;
+            } else if (id == 6) {
+                showDiscStatusDialog();
+                return true;
+            } else if (id >= 10 && id < 14) {
+                pickDiscImage(id - 10);
+                return true;
+            } else if (id == 20) {
+                exportSaves();
+                return true;
+            } else if (id == 21) {
+                pickSavesArchive();
+                return true;
+            } else if (id == 30) {
+                mImportModJarLauncher.launch("*/*");
+                return true;
+            } else if (id == 35) {
+                mImportModZipLauncher.launch(new String[]{
+                        "application/zip", "application/x-zip-compressed", "application/octet-stream"});
+                return true;
+            } else if (id == 34) {
+                mImportModsFolderLauncher.launch(null);
+                return true;
+            } else if (id == 31) {
+                showAppFolderDialog();
+                return true;
+            } else if (id == 40) {
+                setHandheldMode(!loadHandheldMode());
+                return true;
+            } else if (id == 41) {
+                setTouchPad(!loadTouchPad());
+                return true;
+            } else if (id == 42) {
+                chooseTouchPadOpacity();
+                return true;
+            } else if (id == 43) {
+                resetControls();
+                return true;
+            }
+            return false;
+        });
+        menu.show();
+        SCActionTrail.record("Options menu opened");
+    }
+
+    /** Persisted Handheld Mode setting (read by SCGameActivity at launch). */
+    private boolean loadHandheldMode() {
+        try {
+            return getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getBoolean(PREF_HANDHELD, false);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private void setHandheldMode(final boolean enabled) {
+        try {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit().putBoolean(PREF_HANDHELD, enabled).apply();
+        } catch (Exception ignored) {}
+        String label = enabled
+                ? "Handheld Mode ON (touch = mouse, single BACK exits, no exit button)"
+                : "Handheld Mode OFF";
+        try {
+            android.widget.Toast.makeText(this, label, android.widget.Toast.LENGTH_SHORT).show();
+        } catch (Exception ignored) {}
+        LogFile.log(label);
+        SCActionTrail.record(label);
+        updateLaunchReady();
+    }
+
+    /** Persisted "use the Dragoon pad" setting (read by SCGameActivity).
+     *  Defaults ON: the launcher pad is the primary on-screen controller. */
+    public boolean loadTouchPad() {
+        try {
+            return getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getBoolean(PREF_TOUCH_PAD, true);
+        } catch (Exception ignored) {
+            return true;
+        }
+    }
+
+    private void setTouchPad(final boolean enabled) {
+        try {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit().putBoolean(PREF_TOUCH_PAD, enabled).apply();
+        } catch (Exception ignored) {}
+        // The in-game mobile-controls mod is always removed; this only shows or
+        // hides the launcher pad (touch-as-mouse remains for menus).
+        ensureMobileControlsJar();
+        String label = enabled
+                ? "Dragoon Pad ON (Legend of Dragoon themed controls)"
+                : "Dragoon Pad OFF (touch-as-mouse for menus)";
+        try {
+            android.widget.Toast.makeText(this, label, android.widget.Toast.LENGTH_SHORT).show();
+        } catch (Exception ignored) {}
+        LogFile.log(label);
+        SCActionTrail.record(label);
+    }
+
+    /** Small picker for the launcher touch-pad opacity (persisted, applied live). */
+    private void chooseTouchPadOpacity() {
+        final float[] values = {1.0f, 0.75f, 0.5f, 0.3f};
+        final String[] names = {"100%", "75%", "50%", "30%"};
+        final float current = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getFloat("launcher_touch_opacity", 1.0f);
+        int checked = 0;
+        for (int i = 0; i < values.length; i++) {
+            if (Math.abs(values[i] - current) < 0.01f) checked = i;
+        }
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Touch Pad Opacity")
+                .setSingleChoiceItems(names, checked, (d, which) -> {
+                    getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                            .edit().putFloat("launcher_touch_opacity", values[which]).apply();
+                    LogFile.log("Touch pad opacity: " + names[which]);
+                    d.dismiss();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** "Disc N ✓" when the image is on disk, region-flagged when it is not US. */
+    /**
+     * Clears the on-screen pad's saved layout/scale/opacity so the next game
+     * launch shows the default Dragoon Pad arrangement. This replaces the old
+     * in-game double-tap-to-reset gesture.
+     */
+    private void resetControls() {
+        try {
+            getSharedPreferences(
+                    com.severedchains.launcher.ui.TouchGamepadView.PREFS, MODE_PRIVATE)
+                    .edit().clear().apply();
+        } catch (Exception ignored) {}
+        try {
+            android.widget.Toast.makeText(this, "Controls reset to default",
+                    android.widget.Toast.LENGTH_SHORT).show();
+        } catch (Exception ignored) {}
+        LogFile.log("Controls reset to default (launcher menu)");
+        SCActionTrail.record("Controls reset (launcher)");
+    }
+
+    private String discLabel(int index) {
+        if (gameDir == null) return "Disc " + (index + 1);
+        File f = new File(new File(gameDir, "isos"), DISC_FILE_PATTERNS[index]);
+        if (!f.isFile()) {
+            return "Disc " + (index + 1);
+        }
+        SCDiscImage.Info info = SCDiscImage.detect(f);
+        if (info.kind == SCDiscImage.Kind.US) {
+            return "Disc " + (index + 1) + " ✓"
+                    + (info.disc == index + 1 ? "" : " (disc " + info.disc + "?)");
+        }
+        if (info.kind == SCDiscImage.Kind.OTHER_REGION) {
+            return "Disc " + (index + 1) + " ⚠ " + info.region + " (US required)";
+        }
+        return "Disc " + (index + 1) + " ⚠ not a US disc";
+    }
+
+    /**
+     * Per-disc status report (region detection via {@link SCDiscImage}) plus
+     * free space, so the user learns a wrong-region rip is the problem before
+     * the game's unpacker fails with an opaque error. Ported from the setup
+     * screen of dracinn/Severed-Chains-Android.
+     */
+    private void showDiscStatusDialog() {
+        if (gameDir == null) return;
+        File isosDir = new File(gameDir, "isos");
+        StringBuilder sb = new StringBuilder();
+        int us = 0;
+        for (int i = 0; i < DISC_FILE_PATTERNS.length; i++) {
+            File f = new File(isosDir, DISC_FILE_PATTERNS[i]);
+            sb.append("Disc ").append(i + 1).append(": ");
+            if (!f.isFile()) {
+                sb.append("not provided\n");
+                continue;
+            }
+            SCDiscImage.Info info = SCDiscImage.detect(f);
+            sb.append(f.getName()).append(" — ");
+            if (info.kind == SCDiscImage.Kind.US && info.disc == i + 1) {
+                sb.append("US release ✓");
+                us++;
+            } else if (info.kind == SCDiscImage.Kind.US) {
+                sb.append("US release, disc ").append(info.disc)
+                        .append(" (in slot ").append(i + 1).append(")");
+            } else if (info.kind == SCDiscImage.Kind.OTHER_REGION) {
+                sb.append("wrong region (").append(info.region).append(") — US required");
+            } else if (info.volumeId != null) {
+                sb.append("unrecognized disc (id ").append(info.volumeId).append(")");
+            } else {
+                sb.append("no PSX disc marker (unreadable/mid-copy/not a disc image)");
+            }
+            sb.append('\n');
+        }
+        try {
+            android.os.StatFs stat = new android.os.StatFs(isosDir.getAbsolutePath());
+            sb.append("\nFree space: ")
+                    .append(String.format(java.util.Locale.US, "%.1f GB", stat.getAvailableBytes() / 1e9));
+        } catch (Throwable ignored) {
+        }
+        sb.append("\n\nAll four discs must be the US release (SCUS-94491/94584/94585/94586).");
+        SCActionTrail.record("Disc status viewed (" + us + "/4 US)");
+        try {
+            new android.app.AlertDialog.Builder(this)
+                    .setTitle(us == 4 ? "Discs OK (4/4 US)" : "Disc images (" + us + "/4 US)")
+                    .setMessage(sb.toString())
+                    .setPositiveButton("OK", null)
+                    .show();
+        } catch (Exception ignored) {
+        }
+    }
+
+    /**
+     * Copies a user-picked file into the app folder: .jar files go to
+     * gameDir/libs/ (game ModManager class-path scans it, so this is how
+     * mods get installed); anything else goes to the app folder root.
+     * Rejects hostile names (../ escapes, separators).
+     */
+    /** Copies a single picked mod .jar into gameDir/mods/ (top level, so the
+     *  game's mod-loader, which scans mods/*.jar, finds it). */
+    private void importModJar(Uri uri) {
+        if (gameDir == null) return;
+        statusText.setText("Importing mod jar…");
+        LogFile.log("Importing mod jar: " + uri);
+        SCActionTrail.record("Mod jar import started");
+        new Thread(() -> {
+            try {
+                String name = "mod.jar";
+                try (Cursor c = getContentResolver().query(uri,
+                        new String[]{android.provider.OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+                    if (c != null && c.moveToFirst()) {
+                        final String q = c.getString(0);
+                        if (q != null && !q.isEmpty()) name = q;
+                    }
+                } catch (Exception ignored) {}
+                if (name.contains("/") || name.contains("\\") || name.contains("..")) {
+                    throw new IOException("Unsafe file name: " + name);
+                }
+                if (!name.toLowerCase(java.util.Locale.US).endsWith(".jar")) name += ".jar";
+
+                final File modsDir = new File(gameDir, "mods");
+                modsDir.mkdirs();
+                final File dst = new File(modsDir, name);
+                try (InputStream in = getContentResolver().openInputStream(uri);
+                     FileOutputStream out = new FileOutputStream(dst)) {
+                    if (in == null) throw new IOException("Cannot open picked file");
+                    final byte[] buf = new byte[65536];
+                    int n;
+                    while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+                }
+                final String msg = "Imported " + name + " into mods/ — enable at New Campaign → Mods.";
+                LogFile.log(msg + " (" + dst.length() + "b)");
+                SCActionTrail.record("Mod jar imported: " + name);
+                uiHandler.post(() -> {
+                    statusText.setText(msg);
+                    Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+                    refreshAll();
+                });
+            } catch (Exception e) {
+                LogFile.error("Mod jar import failed", e);
+                uiHandler.post(() -> {
+                    statusText.setText("Import failed: " + e.getMessage());
+                    Toast.makeText(this, "Import failed: " + e.getMessage(),
+                            Toast.LENGTH_LONG).show();
+                });
+            }
+        }).start();
+    }
+
+    /** Zip-bomb guard: reject a single entry or a whole archive beyond these. */
+    private static final long MOD_ZIP_MAX_ENTRY_BYTES = 128L * 1024 * 1024;
+    private static final long MOD_ZIP_MAX_TOTAL_BYTES = 512L * 1024 * 1024;
+
+    /**
+     * Unzips a mod archive into {@code gameDir/mods/}.
+     *
+     * <p>Mod authors ship zips in a few shapes — {@code mymod.jar} at the root,
+     * or {@code mymod/mymod.jar} inside a single wrapper folder — and the game's
+     * mod-loader only scans {@code mods/*.jar} at the TOP level. So the archive
+     * is scanned first for a single common top-level folder, which is stripped
+     * when present; that makes the jar land where the loader looks without the
+     * user having to unzip by hand.
+     *
+     * <p>Defensive by design: every entry path is validated (no absolute paths,
+     * no {@code ..} escapes, no backslashes) and re-checked against the canonical
+     * destination, entry sizes are capped, and the total extracted size is
+     * capped, so a hostile or corrupt archive cannot escape mods/ or fill the
+     * device. The original zip is never deleted.
+     */
+    private void importModZip(final Uri uri) {
+        if (gameDir == null) return;
+        statusText.setText("Unzipping mod…");
+        LogFile.log("Unzipping mod: " + uri);
+        SCActionTrail.record("Mod zip import started");
+
+        new Thread(() -> {
+            try {
+                final File modsDir = new File(gameDir, "mods");
+                if (!modsDir.isDirectory() && !modsDir.mkdirs()) {
+                    throw new IOException("Cannot create mods/");
+                }
+                final String modsRoot = modsDir.getCanonicalPath();
+
+                // Pass 1: entry names only, to find a single common root folder.
+                final List<String> names = new ArrayList<>();
+                try (InputStream in = openZip(uri);
+                     ZipInputStream zis = new ZipInputStream(in)) {
+                    ZipEntry e;
+                    while ((e = zis.getNextEntry()) != null) {
+                        if (!e.isDirectory()) names.add(e.getName());
+                    }
+                }
+                if (names.isEmpty()) throw new IOException("Archive contains no files");
+
+                final String strip = commonRootFolder(names);
+                if (strip != null) {
+                    LogFile.log("Mod zip: stripping single top-level folder '" + strip + "'");
+                }
+
+                // Pass 2: extract.
+                int files = 0;
+                int jars = 0;
+                long total = 0;
+                try (InputStream in = openZip(uri);
+                     ZipInputStream zis = new ZipInputStream(in)) {
+                    ZipEntry e;
+                    while ((e = zis.getNextEntry()) != null) {
+                        if (e.isDirectory()) continue;
+                        String name = e.getName().replace('\\', '/');
+                        if (strip != null && name.startsWith(strip)) {
+                            name = name.substring(strip.length());
+                        }
+                        name = name.replaceAll("^/+", "");
+                        if (name.isEmpty()) continue;
+
+                        if (name.contains("..") || name.contains("//") || name.indexOf(':') >= 0) {
+                            LogFile.log("Mod zip: skipped unsafe entry '" + e.getName() + "'");
+                            continue;
+                        }
+                        // Nested jars are kept rather than skipped: mods ship helper
+                        // data and libraries in subfolders next to the top-level jar.
+                        final File dst = new File(modsDir, name);
+                        if (!dst.getCanonicalPath().startsWith(modsRoot + File.separator)) {
+                            LogFile.log("Mod zip: blocked path escape '" + e.getName() + "'");
+                            continue;
+                        }
+                        // The declared entry size is only a hint (it is -1 for streamed
+                        // entries), so the caps are enforced against the bytes
+                        // actually written while copying.
+                        if (e.getSize() > MOD_ZIP_MAX_ENTRY_BYTES) {
+                            throw new IOException("Entry too large (" + name + ")");
+                        }
+
+                        final File parent = dst.getParentFile();
+                        if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
+                            throw new IOException("Cannot create " + parent.getName());
+                        }
+                        long written = 0;
+                        try (OutputStream out = new FileOutputStream(dst)) {
+                            final byte[] buf = new byte[65536];
+                            int n;
+                            while ((n = zis.read(buf)) != -1) {
+                                written += n;
+                                if (written > MOD_ZIP_MAX_ENTRY_BYTES) {
+                                    throw new IOException("Entry too large (" + name + ")");
+                                }
+                                total += n;
+                                if (total > MOD_ZIP_MAX_TOTAL_BYTES) {
+                                    throw new IOException("Archive expands past the size limit");
+                                }
+                                out.write(buf, 0, n);
+                            }
+                        }
+                        files++;
+                        if (name.toLowerCase(java.util.Locale.US).endsWith(".jar")
+                                && name.indexOf('/') < 0) {
+                            jars++;
+                        }
+                        LogFile.log("Mod zip: " + name + " -> " + dst.getAbsolutePath()
+                                + " (" + dst.length() + "b)");
+                    }
+                }
+
+                final String msg = "Unzipped " + files + " file(s) into mods/"
+                        + (jars > 0 ? " (" + jars + " mod jar at top level)" : " — no top-level .jar found")
+                        + " — enable at New Campaign → Mods.";
+                LogFile.log(msg);
+                SCActionTrail.record("Mod zip unzipped: " + files + " files");
+                uiHandler.post(() -> {
+                    statusText.setText(msg);
+                    Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+                    refreshAll();
+                });
+            } catch (Exception e) {
+                LogFile.error("Mod zip import failed", e);
+                uiHandler.post(() -> {
+                    statusText.setText("Unzip failed: " + e.getMessage());
+                    Toast.makeText(this, "Unzip failed: " + e.getMessage(),
+                            Toast.LENGTH_LONG).show();
+                });
+            }
+        }).start();
+    }
+
+    private InputStream openZip(final Uri uri) throws IOException {
+        final InputStream in = getContentResolver().openInputStream(uri);
+        if (in == null) throw new IOException("Cannot open picked file");
+        return in;
+    }
+
+    /**
+     * Returns {@code "name/"} when every entry sits under one common top-level
+     * folder, else null (the archive root is used as-is).
+     */
+    private static String commonRootFolder(final List<String> names) {
+        String root = null;
+        for (final String n : names) {
+            final String clean = n.replace('\\', '/');
+            final int slash = clean.indexOf('/');
+            if (slash <= 0) return null; // an entry at the archive root
+            final String top = clean.substring(0, slash + 1);
+            if (root == null) {
+                root = top;
+            } else if (!root.equals(top)) {
+                return null;
+            }
+        }
+        return root;
+    }
+
+    private void importModsFolder(Uri treeUri) {
+        if (gameDir == null) return;
+        statusText.setText("Installing mods from folder…");
+        LogFile.log("Installing mods from folder: " + treeUri);
+        SCActionTrail.record("Mods folder install started");
+        new Thread(() -> {
+            final int[] counts = {0}; // {files}
+            try {
+                new File(gameDir, "mods").mkdirs();
+                final String rootId = android.provider.DocumentsContract.getTreeDocumentId(treeUri);
+                final Uri rootChildren = android.provider.DocumentsContract
+                        .buildChildDocumentsUriUsingTree(treeUri, rootId);
+                copyModTree(treeUri, rootChildren, "", counts);
+                final String msg = "Installed " + counts[0] + " file(s) into mods/"
+                        + " — enable at New Campaign → Mods.";
+                LogFile.log(msg);
+                SCActionTrail.record("Mods folder installed: " + counts[0] + " files");
+                uiHandler.post(() -> {
+                    statusText.setText(msg);
+                    Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+                    refreshAll();
+                });
+            } catch (Exception e) {
+                LogFile.error("Mods folder install failed", e);
+                uiHandler.post(() -> {
+                    statusText.setText("Install failed: " + e.getMessage());
+                    Toast.makeText(this, "Install failed: " + e.getMessage(),
+                            Toast.LENGTH_LONG).show();
+                });
+            }
+        }).start();
+    }
+
+    /** Recursively copies a SAF tree: .jar → gameDir/libs/, other files →
+     *  gameDir, both preserving the folder's relative subpaths. */
+    private void copyModTree(final Uri treeUri, final Uri childrenUri, final String rel,
+                             final int[] counts) throws Exception {
+        final android.content.ContentResolver cr = getContentResolver();
+        try (Cursor c = cr.query(childrenUri, new String[]{
+                android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE},
+                null, null, null)) {
+            if (c == null) return;
+            while (c.moveToNext()) {
+                final String docId = c.getString(0);
+                final String name = c.getString(1);
+                final String mime = c.getString(2);
+                if (docId == null || name == null) continue;
+                if (name.contains("/") || name.contains("\\") || name.contains("..")) continue;
+                final String childRel = rel.isEmpty() ? name : rel + "/" + name;
+
+                if (android.provider.DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) {
+                    final Uri grand = android.provider.DocumentsContract
+                            .buildChildDocumentsUriUsingTree(treeUri, docId);
+                    copyModTree(treeUri, grand, childRel, counts);
+                    continue;
+                }
+
+                // Mods live in gameDir/mods/ — the game's mod-loader
+                // (ModManager.Access.findMods) scans that folder for *.jar and
+                // loads each via its own URLClassLoader. A mod is typically a
+                // jar plus a folder, so the whole tree is preserved verbatim.
+                final File dstDir = new File(gameDir, "mods");
+                final File dst = new File(dstDir, childRel);
+                if (!dst.getCanonicalPath().startsWith(dstDir.getCanonicalPath())) continue; // zip-slip
+                dst.getParentFile().mkdirs();
+                final Uri docUri = android.provider.DocumentsContract
+                        .buildDocumentUriUsingTree(treeUri, docId);
+                try (InputStream in = cr.openInputStream(docUri);
+                     FileOutputStream out = new FileOutputStream(dst)) {
+                    if (in == null) continue;
+                    final byte[] buf = new byte[65536];
+                    int n;
+                    while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+                }
+                counts[0]++;
+                LogFile.log("Installed " + childRel + " -> " + dst.getAbsolutePath()
+                        + " (" + dst.length() + "b)");
+            }
+        }
+    }
+
+    /**
+     * Shows the user where the app folder is and what lives there, with a
+     * shortcut into the mod-file importer. Non-root users can't browse
+     * internal storage with a file manager, so this dialog + importer is
+     * their access path for mod support.
+     */
+    private void showAppFolderDialog() {
+        if (gameDir == null) return;
+        String msg = "App folder:\n" + gameDir.getAbsolutePath()
+                + "\n\nMods go in:\nmods/  (a .jar, plus any folder it needs)"
+                + "\n\nDisc images go in:\nisos/"
+                + "\n\nUse “Import Mod Jar…” for a single .jar, “Import Mod "
+                + "Zip…” to unzip a mod archive, or “Import Mod Folder…” for an "
+                + "already-unzipped mod — all three land in mods/. Enable mods at "
+                + "New Campaign → Mods.";
+        new AlertDialog.Builder(this)
+                .setTitle("App Folder (mod support)")
+                .setMessage(msg)
+                .setPositiveButton("Import Mod Zip…",
+                        (d, w) -> mImportModZipLauncher.launch(new String[]{
+                                "application/zip", "application/x-zip-compressed", "application/octet-stream"}))
+                .setNeutralButton("Import Mod Folder…",
+                        (d, w) -> mImportModsFolderLauncher.launch(null))
+                .setNegativeButton("Close", null)
+                .show();
+        SCActionTrail.record("App folder dialog opened");
+    }
+
     private void refreshAll() {
-        downloadJreButton.setVisibility(View.GONE);
         downloadStatusText.setVisibility(View.GONE);
         checkGameFiles();
         checkJreStatus();
-        updateDiscButtons();
         ensureFfmpegAndroid();
-    }
-
-    /** Shows which of the 4 discs are on disk (user maps them explicitly). */
-    private void updateDiscButtons() {
-        if (gameDir == null) return;
-        File isosDir = new File(gameDir, "isos");
-        for (int i = 0; i < 4; i++) {
-            if (mDiscButtons[i] == null) continue;
-            boolean present = new File(isosDir, DISC_FILE_PATTERNS[i]).exists();
-            mDiscButtons[i].setText("Disc " + (i + 1) + (present ? " ✓" : ""));
-        }
     }
 
     // ------------------------------------------------------------------
@@ -695,12 +1643,12 @@ public class SCLauncherActivity extends AppCompatActivity {
     private void ensureFfmpegAndroid() {
         if (gameDir == null || mFfmpegDownloadRunning) return;
         File libsDir = new File(gameDir, "libs");
-        File target = new File(libsDir, FFMPEG_ANDROID_FILE);
+        File target = new File(libsDir, ffmpegAndroidFile());
         // bytedeco 1.5.13 ships Android libs under lib/<abi>/ inside the jar.
         if (target.exists() && target.length() > 1024 * 1024) {
             try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(target)) {
-                if (zf.getEntry("lib/arm64-v8a/libjniavutil.so") != null) {
-                    LogFile.log("android-arm64 ffmpeg present, intro video ready");
+                if (zf.getEntry(ffmpegLibPrefix() + "libjniavutil.so") != null) {
+                    LogFile.log(ffmpegLibPrefix() + " ffmpeg present, intro video ready");
                     extractFfmpegNatives(target);
                     return;
                 }
@@ -720,7 +1668,7 @@ public class SCLauncherActivity extends AppCompatActivity {
             return;
         }
         mFfmpegDownloadRunning = true;
-        LogFile.log("Downloading android-arm64 ffmpeg for intro video...");
+        LogFile.log("Downloading " + ffmpegLibPrefix() + " ffmpeg for intro video...");
         uiHandler.post(() -> {
             launchButton.setEnabled(false);
             if (statusText.getText().toString().startsWith("Ready to launch")) {
@@ -730,24 +1678,24 @@ public class SCLauncherActivity extends AppCompatActivity {
         new Thread(() -> {
             try {
                 // Atomic: game must never see a partial jar on the classpath.
-                File part = new File(libsDir, FFMPEG_ANDROID_FILE + ".part");
+                File part = new File(libsDir, ffmpegAndroidFile() + ".part");
                 part.delete();
-                downloadFile(FFMPEG_MAVEN_BASE + FFMPEG_ANDROID_FILE, part);
+                downloadFile(FFMPEG_MAVEN_BASE + ffmpegAndroidFile(), part);
                 LogFile.log("ffmpeg download bytes: " + part.length());
                 // Validate BEFORE rename: truncated downloads are the norm on
                 // mobile data and produce jars that fail later with confusing
                 // loader errors instead of a clear message here.
                 try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(part)) {
-                    if (zf.getEntry("lib/arm64-v8a/libjniavutil.so") == null) {
+                    if (zf.getEntry(ffmpegLibPrefix() + "libjniavutil.so") == null) {
                         throw new IOException("downloaded jar lacks libjniavutil.so");
                     }
                 } catch (java.util.zip.ZipException e) {
                     throw new IOException("downloaded jar is corrupt/truncated", e);
                 }
-                if (!part.renameTo(new File(libsDir, FFMPEG_ANDROID_FILE))) {
+                if (!part.renameTo(new File(libsDir, ffmpegAndroidFile()))) {
                     throw new IOException("rename of ffmpeg download failed");
                 }
-                LogFile.log("Downloaded " + FFMPEG_ANDROID_FILE);
+                LogFile.log("Downloaded " + ffmpegAndroidFile());
                 SCActionTrail.record("Video support downloaded (ffmpeg android)");
                 uiHandler.post(() -> {
                     mFfmpegDownloadRunning = false;
@@ -783,7 +1731,7 @@ public class SCLauncherActivity extends AppCompatActivity {
             while (en.hasMoreElements()) {
                 java.util.zip.ZipEntry e = en.nextElement();
                 String name = e.getName();
-                if (name.startsWith("lib/arm64-v8a/") && name.endsWith(".so")) {
+                if (name.startsWith(ffmpegLibPrefix()) && name.endsWith(".so")) {
                     String base = name.substring(name.lastIndexOf('/') + 1);
                     try (InputStream in = zf.getInputStream(e);
                          FileOutputStream out = new FileOutputStream(new File(outDir, base))) {
@@ -806,6 +1754,51 @@ public class SCLauncherActivity extends AppCompatActivity {
     // runs on desktop Linux (glibc natives, game LWJGL, JavaFX shim target,
     // desktop ffmpeg), plus our bionic LWJGL stack from libs_natives/.
     // ------------------------------------------------------------------
+    /**
+     * Restores the pristine game jar from the APK asset whenever the current
+     * patch-revision marker (see {@link GameJarPatcher#MARKER}) is absent.
+     * The bytecode patches are applied to the deployed jar in place and there
+     * is no pristine copy on-device, so seeding each revision from the asset
+     * prevents the GlesMesh guard from nesting when a new revision ships and
+     * heals any install left partially patched. The patcher writes the marker
+     * after a successful patch, so this costs at most one asset copy per patch
+     * revision (never on a normal launch).
+     */
+    private void restorePristineGameJarIfNeeded(File mainJar) {
+        if (new File(gameDir, GameJarPatcher.MARKER).exists()) return;
+        try {
+            if (mainJar.exists()) {
+                try (InputStream in = getAssets().open("game/" + MAIN_JAR_NAME);
+                     FileOutputStream out = new FileOutputStream(mainJar)) {
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = in.read(buf)) != -1) {
+                        out.write(buf, 0, n);
+                    }
+                }
+                new File(gameDir, ".glesmesh_patch_v1").delete();
+                new File(gameDir, ".glesmesh_patch_v2").delete();
+                new File(gameDir, ".gamejar_healed_v2").delete();
+                // Every stale patch-marker revision, current one included: we only
+                // get here when the current marker is absent, and the pristine jar
+                // has just been restored, so all of them are stale by definition.
+                // Enumerating them by hand used to rot (the list lagged the MARKER
+                // bump), so sweep the prefix instead.
+                final File[] staleMarkers = gameDir.listFiles((d, name) ->
+                        name.startsWith(".gamejar_patch") || name.startsWith(".glesmesh_patch"));
+                if (staleMarkers != null) {
+                    for (final File stale : staleMarkers) {
+                        stale.delete();
+                    }
+                }
+                new File(gameDir, MAIN_JAR_NAME + ".glespatch.tmp").delete();
+                LogFile.log("Restored pristine game jar for " + GameJarPatcher.MARKER);
+            }
+        } catch (Exception e) {
+            LogFile.error("Failed to restore pristine game jar", e);
+        }
+    }
+
     private void checkGameFiles() {
         File mainJar = new File(gameDir, MAIN_JAR_NAME);
         File libsDir = new File(gameDir, "libs");
@@ -814,6 +1807,30 @@ public class SCLauncherActivity extends AppCompatActivity {
             statusText.setText("Game files not found.\nPlace Severed Chains in:\n" + gameDir.getAbsolutePath());
             launchButton.setEnabled(false);
             return;
+        }
+
+        // Seed the pristine jar once per patch revision so the in-place
+        // bytecode patches can't nest across revisions, then apply them.
+        restorePristineGameJarIfNeeded(mainJar);
+
+        // Runtime bytecode patches:
+        //  - GlesMesh.draw: skip <3-vertex triangle draws (Adreno spam). All builds.
+        //  - Unpacker: bound the virtual-thread ISO rip to a fixed pool so
+        //    Android never exhausts its file descriptors (EMFILE storm).
+        //    ALL builds (borrowed from Severed-Chains-Android; was lite-only).
+        //  - Config.lowMemoryUnpacker: force the disk-backed unpacker from the
+        //    start instead of only after a first OOM. ALL builds.
+        //  - IsoReader: exact seek/readFully instead of the lseek-backed
+        //    skipBytes/partial-read pair (Android read storm). ALL builds.
+        // Idempotent, re-applied after game updates.
+        try {
+            GameJarPatcher.Result patch = GameJarPatcher.patch(mainJar, gameDir, true, true);
+            LogFile.log("GameJarPatcher: " + patch.message);
+            if (patch.patched) {
+                SCActionTrail.record("Game jar patched (" + patch.message + ")");
+            }
+        } catch (Throwable t) {
+            LogFile.error("GameJarPatcher threw", t);
         }
 
         List<File> cpEntries = new ArrayList<>();
@@ -883,13 +1900,11 @@ public class SCLauncherActivity extends AppCompatActivity {
             jreStatusText.setText("JRE 25: " + foundJreName + " \u2713");
             jreStatusText.setTextColor(0xFF88FF88);
             jreStatusText.setVisibility(View.VISIBLE);
-            downloadJreButton.setVisibility(View.GONE);
             updateLaunchReady();
         } else {
             jreStatusText.setText("JRE 25: Not installed");
             jreStatusText.setTextColor(0xFFFF8888);
             jreStatusText.setVisibility(View.VISIBLE);
-            downloadJreButton.setVisibility(View.VISIBLE);
             launchButton.setEnabled(false);
         }
     }
@@ -911,7 +1926,7 @@ public class SCLauncherActivity extends AppCompatActivity {
     // ------------------------------------------------------------------
     private void launchGame() {
         launchButton.setEnabled(false);
-        searchAgainButton.setEnabled(false);
+        menuButton.setEnabled(false);
         progressBar.setVisibility(View.VISIBLE);
         // Swap the selected shader variant in before the JVM starts — the
         // game transpiles gfx/shaders/ at load, so this takes effect now.
@@ -933,7 +1948,8 @@ public class SCLauncherActivity extends AppCompatActivity {
 
             String mainClass = "legend.game.Main";
             ArrayList<String> appArgs = new ArrayList<String>();
-            appArgs.add("-Xmx2G");
+            // Heap is set as a real JVM arg in buildVmArgs(); "-Xmx2G" here
+            // would be a program arg the game ignores.
             appArgs.add("-ea");
 
             LogFile.log("Launching SCGameActivity with runtime: " + foundJreName
@@ -959,7 +1975,7 @@ public class SCLauncherActivity extends AppCompatActivity {
         } finally {
             progressBar.setVisibility(View.GONE);
             launchButton.setEnabled(true);
-            searchAgainButton.setEnabled(true);
+            menuButton.setEnabled(true);
             statusText.setText("Game display launched — see game screen + log.");
         }
     }
@@ -1012,7 +2028,7 @@ public class SCLauncherActivity extends AppCompatActivity {
             public void run() {
                 progressBar.setVisibility(View.GONE);
                 launchButton.setEnabled(true);
-                searchAgainButton.setEnabled(true);
+                menuButton.setEnabled(true);
                 
                 // Show detailed dialog
                 new AlertDialog.Builder(SCLauncherActivity.this)
@@ -1058,6 +2074,11 @@ public class SCLauncherActivity extends AppCompatActivity {
         sb.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n");
         sb.append("Android: ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
         sb.append(SCGpuInfo.summary()).append("\n");
+        try {
+            sb.append("--- vulkan probe ---\n").append(SCVulkanProbe.summary(this)).append("\n");
+        } catch (Exception e) {
+            sb.append("--- vulkan probe failed: ").append(e.getMessage()).append(" ---\n");
+        }
         File launcher = LogFile.getLogFile();
         sb.append("\n--- launcher log ---\n").append(readTail(launcher, 256 * 1024));
         File latest = new File(getFilesDir(), "latestlog.txt");
@@ -1157,8 +2178,8 @@ public class SCLauncherActivity extends AppCompatActivity {
     private void downloadJre25() {
         LogFile.log("Starting JRE 25 installation...");
         SCActionTrail.record("JRE 25 install started (download)");
-        downloadJreButton.setEnabled(false);
-        searchAgainButton.setEnabled(false);
+        menuButton.setEnabled(false);
+        menuButton.setEnabled(false);
         launchButton.setEnabled(false);
         progressBar.setVisibility(View.VISIBLE);
         downloadStatusText.setVisibility(View.VISIBLE);
@@ -1176,13 +2197,13 @@ public class SCLauncherActivity extends AppCompatActivity {
                     }
                     destDir.mkdirs();
 
-                    File jreXz = new File(destDir, JRE_ARM64_FILE);
+                    File jreXz = new File(destDir, jreArchiveName());
                     boolean usedLocalAsset = false;
 
                     // Try local asset first
                     try {
                         updateDownloadStatus("Extracting bundled JRE 25...");
-                        InputStream assetIn = getAssets().open(LOCAL_JRE_ASSET);
+                        InputStream assetIn = getAssets().open(localJreAsset());
                         FileOutputStream assetOut = new FileOutputStream(jreXz);
                         byte[] buf = new byte[8192];
                         int n;
@@ -1200,8 +2221,8 @@ public class SCLauncherActivity extends AppCompatActivity {
                     // Fallback to download if local asset not available
                     if (!usedLocalAsset) {
                         updateDownloadStatus("Downloading JRE 25...");
-                        LogFile.log("Downloading from: " + JRE_BASE_URL + JRE_ARM64_FILE);
-                        downloadFile(JRE_BASE_URL + JRE_ARM64_FILE, jreXz);
+                        LogFile.log("Downloading from: " + JRE_BASE_URL + jreArchiveName());
+                        downloadFile(JRE_BASE_URL + jreArchiveName(), jreXz);
                         LogFile.log("Downloaded: " + jreXz.length() + " bytes");
                     }
 
@@ -1217,6 +2238,7 @@ public class SCLauncherActivity extends AppCompatActivity {
                         File[] altPaths = {
                             new File(destDir, "lib/aarch64/jli/libjli.so"),
                             new File(destDir, "lib/arm64/jli/libjli.so"),
+                            new File(destDir, "lib/x86_64/jli/libjli.so"),
                             new File(destDir, "lib/jli.so")
                         };
                         boolean found = false;
@@ -1248,7 +2270,7 @@ public class SCLauncherActivity extends AppCompatActivity {
                         public void run() {
                             progressBar.setVisibility(View.GONE);
                             downloadStatusText.setVisibility(View.GONE);
-                            searchAgainButton.setEnabled(true);
+                            menuButton.setEnabled(true);
                             refreshAll();
                         }
                     });
@@ -1261,8 +2283,8 @@ public class SCLauncherActivity extends AppCompatActivity {
                             progressBar.setVisibility(View.GONE);
                             downloadStatusText.setText("Download failed: " + e.getMessage());
                             downloadStatusText.setTextColor(0xFFFF6666);
-                            downloadJreButton.setEnabled(true);
-                            searchAgainButton.setEnabled(true);
+                            menuButton.setEnabled(true);
+                            menuButton.setEnabled(true);
                         }
                     });
                 }
@@ -1497,6 +2519,13 @@ public class SCLauncherActivity extends AppCompatActivity {
 
         List<String> args = new ArrayList<String>();
 
+        // Heap: JVM ergonomics (25% of RAM) is often too small for the game's
+        // in-memory ISO unpacker on low-end devices, which then falls back to
+        // the much slower file-backed "low memory" unpacker. Give it a sane,
+        // clamped share of physical RAM. (The old "-Xmx2G" was passed after
+        // the main class as a program arg, so the JVM never applied it.)
+        args.add("-Xmx" + computeMaxHeapMb() + "m");
+
         args.add("-Djoml.fastmath");
         args.add("-Djoml.sinLookup");
         args.add("-Djoml.useMathFma");
@@ -1518,6 +2547,8 @@ public class SCLauncherActivity extends AppCompatActivity {
 
         args.add("-Dorg.lwjgl.system.SharedLibraryExtractPath=" + lwjglExtractDir.getAbsolutePath());
         args.add("-Dorg.lwjgl.opengl.libname=libGLESv2.so");
+        // All modes: native system GLES (Zink disabled). SDL creates the
+        // context from the system EGL, so LWJGL looks it up there too.
         args.add("-Dorg.lwjgl.opengles.libname=libGLESv2.so");
         args.add("-Dorg.lwjgl.sdl.libname=" + new File(nativeLibDir, "libSDL3.so").getAbsolutePath());
         // Pin OpenAL to our bundled OpenSL build (same as SDL above). Without
@@ -1555,6 +2586,32 @@ public class SCLauncherActivity extends AppCompatActivity {
         return args;
     }
 
+    /**
+     * Max JVM heap in MB: a third of physical RAM, clamped to [768, 2560].
+     * Falls back to 1536 when RAM cannot be read (e.g. API oddities).
+     */
+    private int computeMaxHeapMb() {
+        long totalMb = 0;
+        try {
+            android.app.ActivityManager am = (android.app.ActivityManager)
+                    getSystemService(ACTIVITY_SERVICE);
+            android.app.ActivityManager.MemoryInfo mi = new android.app.ActivityManager.MemoryInfo();
+            if (am != null) {
+                am.getMemoryInfo(mi);
+                totalMb = mi.totalMem / (1024L * 1024L);
+            }
+        } catch (Throwable ignored) {
+        }
+        if (totalMb <= 0) {
+            return 1536;
+        }
+        long heapMb = totalMb / 3;
+        if (heapMb < 768) heapMb = 768;
+        if (heapMb > 2560) heapMb = 2560;
+        LogFile.log("Max heap: " + heapMb + "m (physical RAM " + totalMb + "m)");
+        return (int) heapMb;
+    }
+
     // ------------------------------------------------------------------
     // Disc images (user-supplied, not redistributable): explicit per-disc
     // picker buttons copy into isos/discN.bin; the unpacker is the final
@@ -1570,22 +2627,50 @@ public class SCLauncherActivity extends AppCompatActivity {
     }
 
     private void copyDiscImage(Uri uri, String targetName) {
-        File isosDir = new File(gameDir, "isos");
+        final File isosDir = new File(gameDir, "isos");
         isosDir.mkdirs();
-        File targetFile = new File(isosDir, targetName);
+        final File targetFile = new File(isosDir, targetName);
 
         new Thread(() -> {
+            // Atomic import: copy to <name>.part, verify length, then rename.
+            // Never leaves the game looking at a half-written disc image.
+            final File part = new File(isosDir, targetName + ".part");
             try {
+                final long expected = queryFileSize(uri);
+                if (expected > 0 && targetFile.isFile() && targetFile.length() == expected) {
+                    logDiscImageInfo(targetFile);
+                    uiHandler.post(() -> {
+                        Toast.makeText(this, targetName + " already imported", Toast.LENGTH_SHORT).show();
+                        refreshAll();
+                    });
+                    return;
+                }
+
                 ContentResolver resolver = getContentResolver();
+                long copied = 0;
                 try (InputStream in = resolver.openInputStream(uri);
-                     FileOutputStream out = new FileOutputStream(targetFile)) {
+                     FileOutputStream out = new FileOutputStream(part)) {
                     if (in == null) throw new IOException("Failed to open input stream");
-                    byte[] buf = new byte[8192];
+                    byte[] buf = new byte[262144];
                     int n;
                     while ((n = in.read(buf)) != -1) {
                         out.write(buf, 0, n);
+                        copied += n;
                     }
                 }
+                if (expected > 0 && copied < expected) {
+                    part.delete();
+                    throw new IOException("Import truncated (" + copied + "/" + expected + " bytes)");
+                }
+                if (targetFile.exists() && !targetFile.delete()) {
+                    part.delete();
+                    throw new IOException("Could not replace existing " + targetName);
+                }
+                if (!part.renameTo(targetFile)) {
+                    part.delete();
+                    throw new IOException("Could not move imported file into place");
+                }
+
                 LogFile.log("Copied disc image to: " + targetFile.getAbsolutePath() + " (" + targetFile.length() + " bytes)");
                 SCActionTrail.record("Disc image copied: " + targetName
                         + " (" + (targetFile.length() / 1048576) + " MB)");
@@ -1595,41 +2680,44 @@ public class SCLauncherActivity extends AppCompatActivity {
                     refreshAll();
                 });
             } catch (Exception e) {
+                part.delete();
                 LogFile.error("Failed to copy disc image", e);
                 uiHandler.post(() -> Toast.makeText(this, "Copy failed: " + e.getMessage(), Toast.LENGTH_LONG).show());
             }
         }).start();
     }
 
+    /** DISPLAY_NAME/SIZE from a content Uri, or -1 if unknown. */
+    private long queryFileSize(Uri uri) {
+        try (Cursor c = getContentResolver().query(uri,
+                new String[]{android.provider.OpenableColumns.SIZE}, null, null, null)) {
+            if (c != null && c.moveToFirst() && !c.isNull(0)) {
+                return c.getLong(0);
+            }
+        } catch (Exception ignored) {
+        }
+        return -1;
+    }
+
     /**
-     * Logs what we can tell about a transferred disc image. Sizes and names
-     * vary by region and rip format, so nothing here blocks or warns the user
-     * — the game's unpacker is the final judge. Checks the ISO9660 "CD001"
-     * marker at sector 16 for both 2048-byte and 2352-byte (raw BIN) sectors.
+     * Logs what the transferred disc image is: US disc N, a wrong-region disc,
+     * or an unrecognized/unreadable file. Detection uses {@link SCDiscImage}
+     * (the game's unpacker remains the final judge).
      */
     private void logDiscImageInfo(File f) {
         long len = f.length();
-        byte[] magic = new byte[5];
-        for (long sectorSize : new long[]{2048, 2352}) {
-            try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "r")) {
-                long off = 16 * sectorSize + 1;
-                if (off + 5 <= len) {
-                    raf.seek(off);
-                    if (raf.read(magic) == 5
-                            && magic[0] == 'C' && magic[1] == 'D'
-                            && magic[2] == '0' && magic[3] == '0' && magic[4] == '1') {
-                        LogFile.log("Disc image has PSX/ISO marker (" + (len / 1048576)
-                                + " MB): " + f.getName());
-                        return;
-                    }
-                }
-            } catch (Exception e) {
-                LogFile.error("Disc check I/O failed", e);
-                return;
-            }
+        SCDiscImage.Info info = SCDiscImage.detect(f);
+        if (info.kind == SCDiscImage.Kind.US) {
+            LogFile.log("Disc image OK (" + targetSizeMb(len) + "): " + f.getName()
+                    + " = US disc " + info.disc + " [" + info.volumeId + "]");
+        } else if (info.kind == SCDiscImage.Kind.OTHER_REGION) {
+            LogFile.log("Disc image is WRONG REGION (" + info.region + ", " + targetSizeMb(len)
+                    + "): " + f.getName() + " — US release required [" + info.volumeId + "]");
+        } else {
+            LogFile.log("Disc image copied (" + targetSizeMb(len)
+                    + ", no recognized US disc marker): " + f.getName()
+                    + (info.volumeId != null ? " [id " + info.volumeId + "]" : ""));
         }
-        LogFile.log("Disc image copied (" + (len / 1048576) + " MB, no ISO marker — "
-                + "may be another region/format): " + f.getName());
     }
 
     private String targetSizeMb(long len) {
@@ -1902,8 +2990,8 @@ public class SCLauncherActivity extends AppCompatActivity {
     private void importJreFile(Uri uri) {
         LogFile.log("Starting JRE 25 import from storage...");
         SCActionTrail.record("JRE 25 install started (import)");
-        downloadJreButton.setEnabled(false);
-        searchAgainButton.setEnabled(false);
+        menuButton.setEnabled(false);
+        menuButton.setEnabled(false);
         launchButton.setEnabled(false);
         progressBar.setVisibility(View.VISIBLE);
         downloadStatusText.setVisibility(View.VISIBLE);
@@ -1944,6 +3032,7 @@ public class SCLauncherActivity extends AppCompatActivity {
                     File[] altPaths = {
                         new File(destDir, "lib/aarch64/jli/libjli.so"),
                         new File(destDir, "lib/arm64/jli/libjli.so"),
+                        new File(destDir, "lib/x86_64/jli/libjli.so"),
                         new File(destDir, "lib/jli.so")
                     };
                     boolean found = false;
@@ -1973,7 +3062,7 @@ public class SCLauncherActivity extends AppCompatActivity {
                 uiHandler.post(() -> {
                     progressBar.setVisibility(View.GONE);
                     downloadStatusText.setVisibility(View.GONE);
-                    searchAgainButton.setEnabled(true);
+                    menuButton.setEnabled(true);
                     refreshAll();
                 });
 
@@ -1983,8 +3072,8 @@ public class SCLauncherActivity extends AppCompatActivity {
                     progressBar.setVisibility(View.GONE);
                     downloadStatusText.setText("Import failed: " + e.getMessage());
                     downloadStatusText.setTextColor(0xFFFF6666);
-                    downloadJreButton.setEnabled(true);
-                    searchAgainButton.setEnabled(true);
+                    menuButton.setEnabled(true);
+                    menuButton.setEnabled(true);
                 });
             }
         }).start();

@@ -11,6 +11,8 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Device vibration for game rumble (ported from Severed-Chains-Android). -->
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
         android:name=".SCApplication"

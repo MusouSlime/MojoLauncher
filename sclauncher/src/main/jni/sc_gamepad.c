@@ -9,6 +9,7 @@
 #include <jni.h>
 #include <dlfcn.h>
 #include <string.h>
+#include <stdbool.h>
 #include <android/log.h>
 
 #include <SDL3/SDL_joystick.h>
@@ -40,6 +41,82 @@ static OpenFn pOpen = NULL;
 static void* sJoystick = NULL;
 static int sInstance = -1;
 
+// ---------------------------------------------------------------------------
+// Rumble -> device vibrator bridge.
+//
+// SDL3 virtual joysticks support a Rumble callback
+// (SDL_VirtualJoystickDesc.Rumble). We install one so the game's
+// SDL_RumbleGamepad() on the virtual pad reaches the phone vibrator via
+// com.severedchains.launcher.SCVibration.vibrate(int low, int high).
+// The callback runs on the game (JVM) SDL thread, so it attaches that thread
+// to the ART VM and calls the cached static method. The class + method are
+// cached from an ART-invoked entry point (see cache_vibration) because
+// FindClass on an attached thread would use the bootstrap classloader.
+// ---------------------------------------------------------------------------
+static JavaVM* g_vm = NULL;
+static jclass g_vib_class = NULL;
+static jmethodID g_vib_method = NULL;
+static bool g_vib_binding = false;
+
+static void cache_vibration(JNIEnv* env) {
+    if (env == NULL) return;
+    if (g_vm == NULL) {
+        (*env)->GetJavaVM(env, &g_vm);
+    }
+    if (g_vib_class == NULL) {
+        jclass local = (*env)->FindClass(env, "com/severedchains/launcher/SCVibration");
+        if (local != NULL) {
+            g_vib_class = (*env)->NewGlobalRef(env, local);
+            (*env)->DeleteLocalRef(env, local);
+        }
+        if (g_vib_class != NULL) {
+            g_vib_method = (*env)->GetStaticMethodID(env, g_vib_class, "vibrate", "(II)V");
+            if (g_vib_method != NULL) {
+                g_vib_binding = true;
+                LOGI("rumble bridge bound to SCVibration.vibrate");
+            } else {
+                LOGE("SCVibration.vibrate(int,int) not found");
+            }
+        } else {
+            LOGE("SCVibration class not found");
+        }
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionDescribe(env);
+            (*env)->ExceptionClear(env);
+        }
+    }
+}
+
+static bool sc_rumble_cb(void* userdata, Uint16 low_frequency_rumble, Uint16 high_frequency_rumble) {
+    (void)userdata;
+    if (!g_vib_binding || g_vm == NULL || g_vib_class == NULL || g_vib_method == NULL) {
+        return false;
+    }
+
+    JNIEnv* env = NULL;
+    bool attached = false;
+    jint r = (*g_vm)->GetEnv(g_vm, (void**)&env, JNI_VERSION_1_6);
+    if (r == JNI_EDETACHED) {
+        if ((*g_vm)->AttachCurrentThread(g_vm, &env, NULL) != JNI_OK) {
+            return false;
+        }
+        attached = true;
+    } else if (r != JNI_OK) {
+        return false;
+    }
+
+    (*env)->CallStaticVoidMethod(env, g_vib_class, g_vib_method,
+            (jint)low_frequency_rumble, (jint)high_frequency_rumble);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+    }
+
+    if (attached) {
+        (*g_vm)->DetachCurrentThread(g_vm);
+    }
+    return true;
+}
+
 static bool resolve(void) {
     if (pAttach) return true;
     sdl_handle = dlopen("libSDL3.so", RTLD_NOLOAD | RTLD_GLOBAL);
@@ -60,11 +137,21 @@ static bool resolve(void) {
     return true;
 }
 
+JNIEXPORT void JNICALL
+Java_com_severedchains_launcher_SCGamepadNative_nativeBindVibration(JNIEnv* env, jclass clazz) {
+    (void)clazz;
+    cache_vibration(env);
+}
+
 JNIEXPORT jint JNICALL
 Java_com_severedchains_launcher_SCGamepadNative_nativeAttach(JNIEnv* env, jclass clazz) {
-    (void)env; (void)clazz;
+    (void)clazz;
     if (sInstance >= 0) return sInstance;
     if (!resolve()) return -1;
+
+    // Ensure the rumble bridge is bound even if SCVibration.init ran before
+    // the library loaded (attach is always invoked from ART).
+    cache_vibration(env);
 
     SDL_VirtualJoystickDesc desc;
     memset(&desc, 0, sizeof(desc));
@@ -77,6 +164,8 @@ Java_com_severedchains_launcher_SCGamepadNative_nativeAttach(JNIEnv* env, jclass
     desc.button_mask = 0x7FFF; // buttons 0..14 valid
     desc.axis_mask = 0x3F;     // axes 0..5 valid
     desc.name = "SCLauncher Virtual Pad";
+    // Implement SDL_RumbleJoystick() for the virtual pad -> phone vibrator.
+    desc.Rumble = sc_rumble_cb;
 
     int inst = pAttach(&desc);
     if (inst < 0) {

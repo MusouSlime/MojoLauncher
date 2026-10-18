@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Dark text on the gold primary button; dimmed when disabled. -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_enabled="false" android:color="#7A7A7A" />
+    <item android:color="#0C1733" />
+</selector>

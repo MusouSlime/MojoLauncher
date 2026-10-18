@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Setup screen (SCLauncherActivity): status readouts, JRE install/import,
-     per-disc image pickers, launch button. All logic lives in the activity;
+<!-- Setup screen (SCLauncherActivity): status readouts + Launch + a single
+     dropdown menu (☰ Menu) holding every other action (re-check, import,
+     discs, JRE, saves, mods, log). All logic lives in the activity;
      this file is layout only. -->
 <androidx.constraintlayout.widget.ConstraintLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
@@ -8,6 +9,7 @@
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
+    android:background="@color/lod_bg"
     android:padding="16dp"
     tools:context=".SCLauncherActivity">
 
@@ -23,7 +25,9 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
-            android:gravity="center_horizontal">
+            android:gravity="center_horizontal"
+            android:background="@drawable/lod_panel"
+            android:padding="18dp">
 
             <TextView
                 android:id="@+id/titleText"
@@ -32,9 +36,20 @@
                 android:text="Severed Chains Launcher"
                 android:textSize="26sp"
                 android:textStyle="bold"
-                android:textColor="@android:color/white"
+                android:textColor="@color/lod_gold"
+                android:letterSpacing="0.05"
+                android:shadowColor="#FF000000"
+                android:shadowDx="1"
+                android:shadowDy="1"
+                android:shadowRadius="2"
                 android:gravity="center"
-                android:layout_marginBottom="16dp" />
+                android:layout_marginBottom="4dp" />
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="2dp"
+                android:background="@color/lod_border"
+                android:layout_marginBottom="14dp" />
 
             <TextView
                 android:id="@+id/statusText"
@@ -42,7 +57,7 @@
                 android:layout_height="wrap_content"
                 android:text="Checking game files..."
                 android:textSize="16sp"
-                android:textColor="@android:color/white"
+                android:textColor="@color/lod_cream"
                 android:gravity="center"
                 android:layout_marginBottom="8dp" />
 
@@ -51,7 +66,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:textSize="13sp"
-                android:textColor="#CCCCCC"
+                android:textColor="@color/lod_dim"
                 android:gravity="center"
                 android:visibility="gone"
                 android:layout_marginBottom="4dp" />
@@ -68,7 +83,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:textSize="13sp"
-                android:textColor="#AAAAFF"
+                android:textColor="#A9C4E8"
                 android:gravity="center"
                 android:visibility="gone"
                 android:layout_marginBottom="4dp" />
@@ -79,202 +94,43 @@
                 android:layout_height="wrap_content"
                 android:text="Launch Severed Chains"
                 android:textSize="18sp"
+                android:textStyle="bold"
+                android:textColor="@color/lod_button_text"
                 android:enabled="false"
+                android:background="@drawable/lod_button_primary"
+                app:backgroundTint="@null"
                 android:paddingHorizontal="48dp"
                 android:paddingVertical="16dp"
-                android:layout_marginTop="4dp"
+                android:layout_marginTop="6dp"
                 android:layout_marginBottom="12dp" />
 
+            <!-- Every other action lives in this dropdown menu. -->
+            <Button
+                android:id="@+id/menuButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="☰  Menu"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:textColor="@color/lod_cream"
+                android:background="@drawable/lod_button"
+                app:backgroundTint="@null"
+                android:paddingHorizontal="32dp"
+                android:paddingVertical="12dp"
+                android:layout_marginBottom="8dp" />
+
+            <!-- Renderer is automatic (Mali -> native GLES + probe, Snapdragon
+                 -> native GLES); this line only reports the auto-selected mode. -->
             <TextView
                 android:id="@+id/gpuModeText"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="GPU: detecting..."
                 android:textSize="14sp"
-                android:textColor="#FFCC66"
+                android:textColor="@color/lod_gold"
                 android:gravity="center"
                 android:layout_marginTop="4dp"
-                android:layout_marginBottom="4dp" />
-
-            <LinearLayout
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal"
-                android:gravity="center"
-                android:layout_marginBottom="4dp">
-
-                <Button
-                    android:id="@+id/snapdragonButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Snap"
-                    android:textSize="14sp"
-                    android:paddingHorizontal="16dp"
-                    android:paddingVertical="12dp"
-                    android:layout_marginEnd="6dp" />
-
-                <Button
-                    android:id="@+id/maliButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Mali-A"
-                    android:textSize="14sp"
-                    android:paddingHorizontal="16dp"
-                    android:paddingVertical="12dp" />
-
-            </LinearLayout>
-
-            <LinearLayout
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal"
-                android:gravity="center"
-                android:layout_marginBottom="8dp">
-
-                <Button
-                    android:id="@+id/maliDebugButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Mali-B dbg"
-                    android:textSize="14sp"
-                    android:paddingHorizontal="16dp"
-                    android:paddingVertical="12dp"
-                    android:layout_marginEnd="6dp" />
-
-                <Button
-                    android:id="@+id/maliFixButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Mali-C"
-                    android:textSize="14sp"
-                    android:paddingHorizontal="16dp"
-                    android:paddingVertical="12dp" />
-
-            </LinearLayout>
-
-            <Button
-                android:id="@+id/searchAgainButton"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Search Again"
-                android:textSize="14sp"
-                android:paddingHorizontal="24dp"
-                android:paddingVertical="12dp"
                 android:layout_marginBottom="8dp" />
-
-            <Button
-                android:id="@+id/sendLogButton"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Send Log"
-                android:textSize="14sp"
-                android:paddingHorizontal="24dp"
-                android:paddingVertical="12dp"
-                android:layout_marginBottom="8dp" />
-
-            <Button
-                android:id="@+id/downloadJreButton"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Download JRE 25"
-                android:textSize="14sp"
-                android:paddingHorizontal="24dp"
-                android:paddingVertical="12dp"
-                android:visibility="gone"
-                android:layout_marginBottom="8dp" />
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Disc images (your files, your mapping):"
-                android:textSize="14sp"
-                android:textColor="@android:color/white"
-                android:layout_marginTop="4dp"
-                android:layout_marginBottom="4dp" />
-
-            <LinearLayout
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal"
-                android:layout_marginBottom="4dp">
-
-                <Button
-                    android:id="@+id/pickDisc1Button"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Disc 1"
-                    android:textSize="14sp"
-                    android:paddingHorizontal="16dp"
-                    android:paddingVertical="12dp"
-                    android:layout_marginEnd="6dp" />
-
-                <Button
-                    android:id="@+id/pickDisc2Button"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Disc 2"
-                    android:textSize="14sp"
-                    android:paddingHorizontal="16dp"
-                    android:paddingVertical="12dp"
-                    android:layout_marginEnd="6dp" />
-
-                <Button
-                    android:id="@+id/pickDisc3Button"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Disc 3"
-                    android:textSize="14sp"
-                    android:paddingHorizontal="16dp"
-                    android:paddingVertical="12dp"
-                    android:layout_marginEnd="6dp" />
-
-                <Button
-                    android:id="@+id/pickDisc4Button"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Disc 4"
-                    android:textSize="14sp"
-                    android:paddingHorizontal="16dp"
-                    android:paddingVertical="12dp" />
-
-            </LinearLayout>
-
-            <Button
-                android:id="@+id/importJreButton"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Import JRE"
-                android:textSize="14sp"
-                android:paddingHorizontal="24dp"
-                android:paddingVertical="12dp"
-                android:layout_marginBottom="8dp" />
-
-            <LinearLayout
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal"
-                android:layout_marginBottom="8dp">
-
-                <Button
-                    android:id="@+id/exportSavesButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Export Saves"
-                    android:textSize="14sp"
-                    android:paddingHorizontal="24dp"
-                    android:paddingVertical="12dp"
-                    android:layout_marginEnd="6dp" />
-
-                <Button
-                    android:id="@+id/importSavesButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Import Saves"
-                    android:textSize="14sp"
-                    android:paddingHorizontal="24dp"
-                    android:paddingVertical="12dp" />
-
-            </LinearLayout>
 
         </LinearLayout>
     </ScrollView>

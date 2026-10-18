@@ -22,14 +22,14 @@ import java.util.Date;
 import java.util.Locale;
 
 /**
- * Application entry point. Owns two app-wide jobs:
- * <ol>
- *   <li>Startup diagnostics: writes a device/version snapshot to
- *   {@code Downloads/SCLogs/startup_*.log} on every launch.</li>
- *   <li>Crash safety net: global uncaught-exception handler that persists a
- *   report (internal {@code crashes/} + {@code Downloads/SCLogs/}) and then
- *   chains to the previous handler. Recursion-safe by design.</li>
- * </ol>
+ * Application entry point. Owns one app-wide job:
+ * crash safety net — a global uncaught-exception handler that persists a
+ * report (internal {@code crashes/} + {@code Downloads/SCLogs/}) and then
+ * chains to the previous handler. Recursion-safe by design.
+ *
+ * <p>Note: per-launch {@code Downloads/SCLogs/startup_*.log} snapshots were
+ * removed (log spam on every cold start). Startup diagnostics still go to
+ * the internal rolling log ({@code filesDir/logs/}) and the game log.
  */
 public class SCApplication extends Application {
     private static final String TAG = "SCApplication";
@@ -39,9 +39,6 @@ public class SCApplication extends Application {
     public void onCreate() {
         super.onCreate();
         Log.i(TAG, "SCLauncher application starting");
-
-        // Write startup log
-        writeStartupLog();
 
         // Install global uncaught exception handler (keep the previous one
         // so we don't recurse into ourselves).
@@ -56,55 +53,9 @@ public class SCApplication extends Application {
     }
 
     // ------------------------------------------------------------------
-    // Startup diagnostics (background thread, never blocks launch).
-    // ------------------------------------------------------------------
-    private void writeStartupLog() {
-        new Thread(() -> {
-            try {
-                String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-                StringBuilder log = new StringBuilder();
-                log.append("=== SCLauncher Startup Log ===\n");
-                log.append("Time: ").append(new Date()).append("\n");
-                log.append("Package: ").append(getPackageName()).append("\n");
-                
-                // Get version info from PackageManager
-                String versionName = "unknown";
-                int versionCode = 0;
-                try {
-                    android.content.pm.PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0);
-                    versionName = pi.versionName;
-                    versionCode = pi.versionCode;
-                } catch (Exception e) {
-                    // ignore
-                }
-                log.append("Version: ").append(versionName).append(" (").append(versionCode).append(")\n");
-                
-                log.append("Android: ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
-                log.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n");
-                log.append("Arch: ").append(System.getProperty("os.arch")).append("\n");
-                log.append("Java VM: ").append(System.getProperty("java.vm.name")).append(" ").append(System.getProperty("java.version")).append("\n");
-                log.append("Native lib dir: ").append(getApplicationInfo().nativeLibraryDir).append("\n");
-                log.append("Files dir: ").append(getFilesDir().getAbsolutePath()).append("\n");
-                log.append("Cache dir: ").append(getCacheDir().getAbsolutePath()).append("\n");
-                log.append("External storage: ").append(Environment.getExternalStorageState()).append("\n");
-                log.append("\n=== System Properties ===\n");
-                for (String key : System.getProperties().stringPropertyNames()) {
-                    if (key.startsWith("java.") || key.startsWith("os.") || key.startsWith("user.")) {
-                        log.append(key).append("=").append(System.getProperty(key)).append("\n");
-                    }
-                }
-                log.append("\n=== App Start Complete ===\n");
-                
-                saveLogToDownloads("startup_" + timestamp + ".log", log.toString());
-            } catch (Exception e) {
-                Log.e(TAG, "Failed to write startup log", e);
-            }
-        }).start();
-    }
-
-    // ------------------------------------------------------------------
     // Log persistence: MediaStore on Android 10+ (scoped storage), legacy
     // public-Downloads path below that, internal filesDir/logs as fallback.
+    // Used by the crash handler below.
     // ------------------------------------------------------------------
     private void saveLogToDownloads(String filename, String content) {
         try {

@@ -1,12 +1,4 @@
 #version 330 core
-// MALI DEBUG VARIANT (RG406H experiment): identical to stock tmd.fsh
-// except the final colour is REPLACED by a flag visualization so one
-// screenshot tells us which per-triangle path each triangle took:
-//   GREEN = textured path, RED = untextured path, BLUE = translucent.
-// All discard logic above still applies. If the garbage spikes render RED
-// while Dart renders GREEN, the flat vertFlags varying (not texture data)
-// is corrupted across the Mali geometry shader. If spikes render GREEN,
-// the flags are fine and the corruption is in UV/tpage/varyings.
 
 in GS_OUT {
   smooth vec2 vertUv;
@@ -45,6 +37,7 @@ uniform vec3 recolour;
 uniform vec2 uvOffset;
 uniform float discardTranslucency;
 uniform int tmdTranslucency;
+uniform int ctmdFlags;
 uniform sampler2D tex24;
 uniform usampler2D tex15;
 
@@ -64,12 +57,14 @@ void main() {
     gl_FragDepth = gl_FragCoord.z;
   }
 
-  bool translucent = (vertFlags & 0x8) != 0;
+  bool ctmd = (ctmdFlags & 0x20) != 0;
+  bool uniformLit = (ctmdFlags & 0x10) != 0;
+  bool translucent = (vertFlags & 0x8) != 0 || (ctmdFlags & 0x2) != 0;
   bool textured = (vertFlags & 0x2) != 0;
   outColour = vertColour;
 
   int translucencyMode = translucency + 1;
-  if(translucent && !textured) {
+  if(translucent && (!textured || uniformLit)) {
     translucencyMode = tmdTranslucency + 1;
   }
 
@@ -115,15 +110,6 @@ void main() {
     if(discardTranslucency == 1 && translucent || discardTranslucency == 2 && !translucent) {
       discard;
     }
-  }
-
-  // MALI DEBUG: replace final colour with the flag path (see header).
-  if(textured) {
-    outColour = vec4(0.0, 1.0, 0.0, 1.0);
-  } else if(translucent) {
-    outColour = vec4(0.0, 0.0, 1.0, 1.0);
-  } else {
-    outColour = vec4(1.0, 0.0, 0.0, 1.0);
   }
 
   outColour.rgb *= recolour;

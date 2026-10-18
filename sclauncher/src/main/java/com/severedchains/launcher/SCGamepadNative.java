@@ -63,6 +63,20 @@ public class SCGamepadNative {
         } catch (UnsatisfiedLinkError ignored) {}
     }
 
+    /**
+     * Ask native to cache the {@link SCVibration} class + {@code vibrate(int,int)}
+     * method id on the app classloader, so the virtual pad's Rumble callback
+     * (invoked on the game thread) can call it without FindClass.
+     * Safe no-op if the library is missing.
+     */
+    public static void bindVibration() {
+        if (!ensureLoaded()) return;
+        try {
+            nativeBindVibration();
+        } catch (UnsatisfiedLinkError ignored) {
+        }
+    }
+
     /** Detach the virtual pad so a physical controller takes player 1. */
     public static void detach() {
         if (!sLoaded || sInstance < 0) return;
@@ -74,6 +88,8 @@ public class SCGamepadNative {
     }
 
     private static native int nativeAttach();
+
+    private static native void nativeBindVibration();
 
     private static native void nativeSetButton(int instance, int button, boolean down);
 

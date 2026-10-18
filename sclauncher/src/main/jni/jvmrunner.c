@@ -8,6 +8,10 @@
 //   4. chdir + ffmpeg      - game-relative paths + bytedeco .so pre-dlopen
 //                            (dlopen here, NEVER ART System.load: CheckJNI
 //                            aborts on these foreign .so files)
+//   4b. raise_fd_limit()   - LITE BUILD ONLY (SC_RAISE_FD_LIMIT): lift
+//                            RLIMIT_NOFILE to the hard limit so the game's
+//                            ISO unpacker doesn't die with EMFILE. The main
+//                            APK leaves the process default untouched.
 //   5. JNI_CreateJavaVM    - exactly once per process (EEXIST otherwise)
 //   6. FindClass + main()  - legend.game.Main.main(appArgs)
 // ---------------------------------------------------------------------------
@@ -22,6 +26,7 @@
 #include <stdbool.h>
 #include <linux/futex.h>
 #include <sys/syscall.h>
+#include <sys/resource.h>
 
 #define LOG_TAG "JVMRunner"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -141,6 +146,59 @@ static void preload_jvm_libs(const char* jre_lib_dir, const char* server_dir) {
     preload_one(jre_lib_dir, "libfontmanager.so");
     preload_one(server_dir, "libjsig.so");
 }
+
+#ifdef SC_RAISE_FD_LIMIT
+// ---------------------------------------------------------------------------
+// Raise the open-file limit before the JVM starts (LITE BUILD ONLY).
+//
+// Android app processes default to a low soft RLIMIT_NOFILE. The game's ISO
+// unpacker (especially its low-memory fallback, which holds one fd per file
+// until the very end) needs thousands of open files at once and dies with
+// EMFILE ("Too many open files"). Lift the soft limit up to the hard limit
+// (capped) so the rip has as many descriptors as the kernel allows. Best
+// effort: log and continue on failure — never fatal to boot.
+// ---------------------------------------------------------------------------
+static void raise_fd_limit(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+        LOGE("getrlimit(RLIMIT_NOFILE) failed: %s", strerror(errno));
+        return;
+    }
+
+    LOGI("RLIMIT_NOFILE before: soft=%llu hard=%llu",
+         (unsigned long long)rl.rlim_cur, (unsigned long long)rl.rlim_max);
+
+    if (rl.rlim_cur >= rl.rlim_max) {
+        LOGI("RLIMIT_NOFILE already at maximum");
+        return;
+    }
+
+    // Target the hard limit, but cap the request: some kernels report
+    // RLIM_INFINITY as the hard limit and we don't want something absurd.
+    const rlim_t cap = (rlim_t)1 << 20; // 1,048,576
+    rlim_t want = rl.rlim_max;
+    if (want == RLIM_INFINITY || want > cap) {
+        want = cap;
+    }
+
+    struct rlimit new_rl = rl;
+    new_rl.rlim_cur = want;
+    if (new_rl.rlim_cur > new_rl.rlim_max) {
+        new_rl.rlim_cur = new_rl.rlim_max;
+    }
+
+    if (setrlimit(RLIMIT_NOFILE, &new_rl) != 0) {
+        LOGE("setrlimit(RLIMIT_NOFILE) failed: %s", strerror(errno));
+        return;
+    }
+
+    // Read back so the log proves what the JVM will actually see.
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        LOGI("RLIMIT_NOFILE after: soft=%llu hard=%llu",
+             (unsigned long long)rl.rlim_cur, (unsigned long long)rl.rlim_max);
+    }
+}
+#endif /* SC_RAISE_FD_LIMIT */
 
 JNIEXPORT jint JNICALL
 Java_com_severedchains_launcher_JVMRunner_nativeLoadJVM(
@@ -270,6 +328,11 @@ Java_com_severedchains_launcher_JVMRunner_nativeLoadJVM(
             }
         }
     }
+
+#ifdef SC_RAISE_FD_LIMIT
+    // Lite build: the game's unpacker needs many open files (see above).
+    raise_fd_limit();
+#endif
 
     JavaVM* jvm;
     void* penv;

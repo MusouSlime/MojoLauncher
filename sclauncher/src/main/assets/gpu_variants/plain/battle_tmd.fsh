@@ -1,34 +1,23 @@
 #version 330 core
-// MALI-C DEBUG VARIANT (RG406H experiment): byte-identical logic to
-// malib/tmd.fsh (GREEN = textured path, RED = untextured, BLUE =
-// translucent). Only the geometry shader differs (unrolled emit, no
-// dynamic index), so Mali-B vs Mali-C isolates exactly one variable.
-// except the final colour is REPLACED by a flag visualization so one
-// screenshot tells us which per-triangle path each triangle took:
-//   GREEN = textured path, RED = untextured path, BLUE = translucent.
-// All discard logic above still applies. If the garbage spikes render RED
-// while Dart renders GREEN, the flat vertFlags varying (not texture data)
-// is corrupted across the Mali geometry shader. If spikes render GREEN,
-// the flags are fine and the corruption is in UV/tpage/varyings.
+// PLAIN-varyings probe for RG406H (Mali-G57): identical logic to stock
+// battle_tmd.fsh, scalar inputs matching plain/tmd.gsh outputs.
 
-in GS_OUT {
-  smooth vec2 vertUv;
-  flat vec2 vertTpage;
-  flat vec2 vertClut;
-  flat int vertBpp;
-  smooth vec4 vertColour;
-  flat int vertFlags;
+smooth in vec2 gVertUv;
+flat in vec2 gVertTpage;
+flat in vec2 gVertClut;
+flat in int gVertBpp;
+smooth in vec4 gVertColour;
+flat in int gVertFlags;
 
-  flat int translucency;
+flat in int gTranslucency;
 
-  flat float widthMultiplier;
-  flat int widthMask;
-  flat int indexShift;
-  flat int indexMask;
+flat in float gWidthMultiplier;
+flat in int gWidthMask;
+flat in int gIndexShift;
+flat in int gIndexMask;
 
-  smooth float depth;
-  smooth float depthOffset;
-};
+smooth in float gDepth;
+smooth in float gDepthOffset;
 
 layout(std140) uniform projectionInfo {
   float znear;
@@ -48,6 +37,7 @@ uniform vec3 recolour;
 uniform vec2 uvOffset;
 uniform float discardTranslucency;
 uniform int tmdTranslucency;
+uniform int ctmdFlags;
 uniform sampler2D tex24;
 uniform usampler2D tex15;
 
@@ -62,44 +52,46 @@ void main() {
 
   // Linearize depth for perspective transforms so that we can render ortho models at specific depths
   if(projectionMode == 2) {
-    gl_FragDepth = (depth - znear) * zdiffInv + depthOffset;
+    gl_FragDepth = (gDepth - znear) * zdiffInv + gDepthOffset;
   } else {
     gl_FragDepth = gl_FragCoord.z;
   }
 
-  bool translucent = (vertFlags & 0x8) != 0;
-  bool textured = (vertFlags & 0x2) != 0;
-  outColour = vertColour;
+  bool ctmd = (ctmdFlags & 0x20) != 0;
+  bool uniformLit = (ctmdFlags & 0x10) != 0;
+  bool translucent = (gVertFlags & 0x8) != 0 || (ctmdFlags & 0x2) != 0;
+  bool textured = (gVertFlags & 0x2) != 0;
+  outColour = gVertColour;
 
-  int translucencyMode = translucency + 1;
-  if(translucent && !textured) {
+  int translucencyMode = gTranslucency + 1;
+  if(translucent && (!textured || uniformLit)) {
     translucencyMode = tmdTranslucency + 1;
   }
 
   // Textured
   if(textured) {
     vec4 texColour;
-    if(vertBpp == 0 || vertBpp == 1) {
+    if(gVertBpp == 0 || gVertBpp == 1) {
       // Calculate CLUT index
-      ivec2 uv = ivec2(vertTpage.x + (vertUv.x + uvOffset.x) * widthMultiplier, vertTpage.y + vertUv.y + uvOffset.y);
+      ivec2 uv = ivec2(gVertTpage.x + (gVertUv.x + uvOffset.x) * gWidthMultiplier, gVertTpage.y + gVertUv.y + uvOffset.y);
       ivec4 indexVec = ivec4(texelFetch(tex15, uv, 0));
-      int p = (indexVec.r >> ((int(vertTpage.x + vertUv.x) & widthMask) << indexShift)) & indexMask;
+      int p = (indexVec.r >> ((int(gVertTpage.x + gVertUv.x) & gWidthMask) << gIndexShift)) & gIndexMask;
 
       // Pull actual pixel colour from CLUT
-      uint pixel = texelFetch(tex15, ivec2(vertClut.x + p, vertClut.y), 0).r;
+      uint pixel = texelFetch(tex15, ivec2(gVertClut.x + p, gVertClut.y), 0).r;
       texColour.a = float(pixel >> 15 & 0x1fu) / 31.0;
       texColour.b = float(pixel >> 10 & 0x1fu) / 31.0;
       texColour.g = float(pixel >>  5 & 0x1fu) / 31.0;
       texColour.r = float(pixel       & 0x1fu) / 31.0;
-    } else if(vertBpp == 2) {
-      ivec2 uv = ivec2(vertTpage.x + (vertUv.x + uvOffset.x), vertTpage.y + vertUv.y + uvOffset.y);
+    } else if(gVertBpp == 2) {
+      ivec2 uv = ivec2(gVertTpage.x + (gVertUv.x + uvOffset.x), gVertTpage.y + gVertUv.y + uvOffset.y);
       uint pixel = texelFetch(tex15, uv, 0).r;
       texColour.a = float(pixel >> 15 & 0x1fu) / 31.0;
       texColour.b = float(pixel >> 10 & 0x1fu) / 31.0;
       texColour.g = float(pixel >>  5 & 0x1fu) / 31.0;
       texColour.r = float(pixel       & 0x1fu) / 31.0;
     } else {
-      texColour = texture(tex24, vertUv + uvOffset);
+      texColour = texture(tex24, gVertUv + uvOffset);
     }
 
     // Discard if (0, 0, 0)
@@ -118,15 +110,6 @@ void main() {
     if(discardTranslucency == 1 && translucent || discardTranslucency == 2 && !translucent) {
       discard;
     }
-  }
-
-  // MALI DEBUG: replace final colour with the flag path (see header).
-  if(textured) {
-    outColour = vec4(0.0, 1.0, 0.0, 1.0);
-  } else if(translucent) {
-    outColour = vec4(0.0, 0.0, 1.0, 1.0);
-  } else {
-    outColour = vec4(1.0, 0.0, 0.0, 1.0);
   }
 
   outColour.rgb *= recolour;

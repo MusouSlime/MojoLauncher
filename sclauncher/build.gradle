@@ -2,6 +2,25 @@ plugins {
     id 'com.android.application' version '8.11.1'
 }
 
+// One APK per architecture. Default = arm64-v8a (device build). Pass
+// -PtargetAbi=x86_64 for the emulator/test build. The native asset set is
+// chosen per target via source sets; the runtime additionally picks the
+// JRE/ffmpeg by process ABI (System.getProperty("os.arch")).
+//
+// Pass -Plite=true to build the side-by-side LITE test APK
+// (com.severedchains.launcher.lite[.debug], APKs/sclauncher-lite-debug.apk).
+// It is the only build that carries the ISO-rip EMFILE mitigations: the
+// native RLIMIT_NOFILE raise (CMake -DSC_RAISE_FD_LIMIT=ON) and the
+// GameJarPatcher Unpacker-concurrency bound. The default build leaves the
+// game's own executors and the process fd limit untouched.
+def targetAbi = (project.findProperty('targetAbi') ?: 'arm64-v8a')
+def isX64 = targetAbi == 'x86_64'
+def isLite = project.hasProperty('lite') && (project.property('lite').toString().toLowerCase() in ['true', '1', 'yes'])
+def baseVersionName = isX64 ? "1.0.33-widescreen-x86_64" : "1.0.33-widescreen"
+def apkBaseName = isLite
+        ? (isX64 ? 'sclauncher-lite-x86_64-debug.apk' : 'sclauncher-lite-debug.apk')
+        : (isX64 ? 'sclauncher-x86_64-debug.apk' : 'sclauncher-sclauncher-debug.apk')
+
 android {
     namespace 'com.severedchains.launcher'
 
@@ -12,16 +31,44 @@ android {
     }
 
     defaultConfig {
-        applicationId "com.severedchains.launcher"
+        applicationId isLite ? "com.severedchains.launcher.lite" : "com.severedchains.launcher"
         minSdkVersion 21
         targetSdkVersion 36
-        versionCode 20260941
-        versionName "1.0.0-rg406h-gpumode3"
+        versionCode 20261046
+        versionName isLite ? baseVersionName + "-lite" : baseVersionName
         multiDexEnabled false
         ndk {
-            abiFilters 'arm64-v8a'
+            abiFilters targetAbi
+        }
+        resValue "string", "app_name", isLite ? "SCLauncher Lite" : "SCLauncher"
+        // Lite-only ISO-rip mitigation toggles (see GameJarPatcher and
+        // jvmrunner.c). lite_emfile_fix also drives the CMake define below.
+        resValue "bool", "lite_emfile_fix", isLite ? "true" : "false"
+        resValue "bool", "lite_lowmem_unpack", isLite ? "true" : "false"
+
+        // Lite build only: compile in raise_fd_limit() (jvmrunner.c).
+        externalNativeBuild {
+            cmake {
+                arguments = ["-DSC_RAISE_FD_LIMIT=" + (isLite ? "ON" : "OFF")]
+            }
         }
     }
+
+    // Native asset sets live in per-ABI source dirs so each APK ships only
+    // its own (~35 MB of LWJGL/opus/shaderc natives each).
+    sourceSets {
+        main {
+            assets.srcDirs = ['src/main/assets', isX64 ? 'src/x86_64/assets' : 'src/arm64/assets']
+        }
+    }
+
+    // Single launcher APK (flavors removed 2026-09-17): the renderer is
+    // auto-selected at runtime (Mali GPUs -> bundled Legacy Zink over
+    // Vulkan, anything else -> native GLES), so snap/mali variants were
+    // redundant. NOTE: testers on the old Mali flavor
+    // (com.severedchains.launcher.mali[.debug]) must uninstall it first —
+    // different app id, side-by-side install would stale-share nothing but
+    // confuse results.
 
     buildTypes {
         debug {
@@ -57,15 +104,56 @@ android {
         }
     }
 
-    // Copy APK to central APKs folder after assemble
+    // Copy the APK to the central APKs folder after assemble (flat, no
+    // flavor subdirs). x86_64 keeps a separate name so it never clobbers
+    // the canonical arm64 APK.
     afterEvaluate {
         task copyApkToCentral(type: Copy) {
             from 'build/outputs/apk/debug'
             into new File(project.projectDir, '../../../SCLauncher/APKs')
             include '*.apk'
-            rename { String name -> "sclauncher-${name}" }
+            rename { String name -> apkBaseName }
+            doFirst {
+                // Guard: AGP's incremental packaging can leave ORPHAN local file
+                // entries in the archive — extra local headers that the central
+                // directory does not reference. They are covered by the APK
+                // signature (so the APK still installs) but they bloat it: a
+                // build with 56 orphans came out 3.5 MB larger than a clean one
+                // with identical content. Since the canonical APK is what testers
+                // install, check the SOURCE apk before it is copied and fail
+                // loudly instead of shipping the bloated one.
+                def src = new File(project.projectDir, 'build/outputs/apk/debug/sclauncher-debug.apk')
+                if (!src.exists()) return
+                def data = src.bytes
+                def localHeaders = 0
+                def off = 0
+                while (off + 4 <= data.length && data[off] == 0x50 && data[off + 1] == 0x4B
+                        && data[off + 2] == 0x03 && data[off + 3] == 0x04) {
+                    int nlen = (data[off + 26] & 0xFF) | ((data[off + 27] & 0xFF) << 8)
+                    int elen = (data[off + 28] & 0xFF) | ((data[off + 29] & 0xFF) << 8)
+                    int comp = (data[off + 18] & 0xFF) | ((data[off + 19] & 0xFF) << 8) \
+                            | ((data[off + 20] & 0xFF) << 16) | ((data[off + 21] & 0xFF) << 24)
+                    off += 30 + nlen + elen + comp
+                    localHeaders++
+                }
+                def central = 0
+                def zf = new java.util.zip.ZipFile(src)
+                try {
+                    central = zf.entries().size()
+                } finally {
+                    zf.close()
+                }
+                if (localHeaders != central) {
+                    throw new GradleException(
+                            "APK has ${localHeaders - central} orphan local entr(y/ies) " +
+                            "(${localHeaders} local headers vs ${central} central entries) — " +
+                            "incremental packaging left stale data in the archive " +
+                            "(${src.length()} bytes). Run './gradlew :sclauncher:clean' and build again.")
+                }
+                println "APK structure OK: ${central} entries, no orphans"
+            }
             doLast {
-                println "Copied APK to ${destinationDir}"
+                println "Copied APK(s) to ${destinationDir} as ${apkBaseName}"
             }
         }
         tasks.assembleDebug.finalizedBy(copyApkToCentral)
@@ -73,23 +161,28 @@ android {
     }
 }
 
-// Rolling source+report zip, refreshed after EVERY build:
-// Backups/sclauncher-report.zip always matches the latest APK (stable name,
-// plus a BUILD-INFO.txt with version + APK md5 stamped at packaging time).
-// Heavy binaries (assets/, jniLibs/) are excluded by design — they ship
-// inside the APK; see REPORT.md for the rebuild inputs.
+// Rolling source+report zip, refreshed after EVERY build. The x86_64 build
+// writes its own zip so the canonical report stays arm64.
 tasks.register('writeBuildInfo') {
     // Order: APK must be copied centrally first (declared explicitly so
-    // Gradle validation accepts reading the APK as an input below).
+    // Gradle validation accepts reading the APK as input below).
     dependsOn('copyApkToCentral')
     def outDir = layout.buildDirectory.dir('report-staging')
-    // Re-stamp whenever the APK changes, so the md5 in the zip is never stale.
-    inputs.file(file('../../../SCLauncher/APKs/sclauncher-sclauncher-debug.apk'))
+    // No declared file inputs: the APK may not exist on the first build
+    // with a new name (Gradle validation fails hard on missing declared
+    // inputs). Always re-stamp instead.
+    outputs.upToDateWhen { false }
     outputs.dir(outDir)
     doLast {
         def d = outDir.get().asFile
         d.mkdirs()
-        def apk = file('../../../SCLauncher/APKs/sclauncher-sclauncher-debug.apk')
+        def lines = new StringBuilder("SCLauncher build info\n" +
+            "Built: ${new Date().format("yyyy-MM-dd HH:mm:ss")}\n" +
+            "abi: ${targetAbi}\n" +
+            "versionCode: ${android.defaultConfig.versionCode}\n" +
+            "versionName: ${android.defaultConfig.versionName}\n")
+        def name = apkBaseName
+        def apk = file("../../../SCLauncher/APKs/${name}")
         def md5 = 'n/a (APK not found)'
         def size = 'n/a'
         if (apk.exists()) {
@@ -98,26 +191,21 @@ tasks.register('writeBuildInfo') {
             md5 = dig.digest().encodeHex().toString()
             size = "${apk.length()} bytes"
         }
-        def vc = android.defaultConfig.versionCode
-        def vn = android.defaultConfig.versionName
-        new File(d, 'BUILD-INFO.txt').text =
-            "SCLauncher build info\n" +
-            "Built: ${new Date().format("yyyy-MM-dd HH:mm:ss")}\n" +
-            "versionCode: ${vc}\n" +
-            "versionName: ${vn}\n" +
-            "APK: ${apk.name} (${size})\n" +
-            "APK md5: ${md5}\n"
-        println "BUILD-INFO: v${vn} (${vc}), apk md5=${md5}"
+        lines.append("APK: ${name} (${size})\nAPK md5: ${md5}\n")
+        new File(d, 'BUILD-INFO.txt').text = lines.toString()
+        println "BUILD-INFO:\n${lines}"
     }
 }
 
 tasks.register('packageReportZip', Zip) {
     dependsOn('writeBuildInfo', 'copyApkToCentral')
-    archiveFileName = 'sclauncher-report.zip'
+    archiveFileName = isLite
+            ? (isX64 ? 'sclauncher-report-lite-x86_64.zip' : 'sclauncher-report-lite.zip')
+            : (isX64 ? 'sclauncher-report-x86_64.zip' : 'sclauncher-report.zip')
     destinationDirectory.set(layout.projectDirectory.dir('../../../SCLauncher/Backups'))
     from('src') {
         into 'sclauncher/src'
-        exclude 'main/assets/**', 'main/jniLibs/**', '**/build/**'
+        exclude '**/assets/**', '**/jniLibs/**', '**/build/**'
     }
     from('build.gradle') { into 'sclauncher' }
     from('../../../SCLauncher/README.md') { into '' }
@@ -133,16 +221,19 @@ tasks.register('packageReportZip', Zip) {
 // cache/lwjgl_native (clns-4 namespace) where their system DT_NEEDED chain
 // (libbinder, libandroid_runtime, ...) is not accessible -> linker spam +
 // "Failed to load a library". Pure libs (opus/spvc/shaderc) stay jar-only.
-// This task keeps jniLibs in sync with the asset jars on every build.
+// This task keeps the target ABI's jniLibs in sync with the asset jars.
 tasks.register('syncLwjglGlueLibs') {
     doLast {
-        def assetsDir = file('src/main/assets/sclauncher_natives')
-        def jniDir = file('src/main/jniLibs/arm64-v8a')
+        def assetsDir = file(isX64 ? 'src/x86_64/assets/sclauncher_natives' : 'src/arm64/assets/sclauncher_natives')
+        def jniDir = file(isX64 ? 'src/main/jniLibs/x86_64' : 'src/main/jniLibs/arm64-v8a')
+        // LWJGL's Android path uses "linux/<arch>" with arch = arm64 or x64.
+        def archDir = isX64 ? 'linux/x64' : 'linux/arm64'
+        def suffix = isX64 ? 'natives-linux-3.4.3.jar' : 'natives-linux-arm64-3.4.3.jar'
         def mapping = [
-            'lwjgl-natives-linux-arm64-3.4.3.jar'                : 'linux/arm64/org/lwjgl/liblwjgl.so',
-            'lwjgl-opengl-natives-linux-arm64-3.4.3.jar'         : 'linux/arm64/org/lwjgl/opengl/liblwjgl_opengl.so',
-            'lwjgl-opengles-natives-linux-arm64-3.4.3.jar'       : 'linux/arm64/org/lwjgl/opengles/liblwjgl_opengles.so',
-            'lwjgl-stb-natives-linux-arm64-3.4.3.jar'            : 'linux/arm64/org/lwjgl/stb/liblwjgl_stb.so',
+            "lwjgl-$suffix"             : "$archDir/org/lwjgl/liblwjgl.so",
+            "lwjgl-opengl-$suffix"      : "$archDir/org/lwjgl/opengl/liblwjgl_opengl.so",
+            "lwjgl-opengles-$suffix"    : "$archDir/org/lwjgl/opengles/liblwjgl_opengles.so",
+            "lwjgl-stb-$suffix"         : "$archDir/org/lwjgl/stb/liblwjgl_stb.so",
         ]
         jniDir.mkdirs()
         mapping.each { jarName, innerPath ->
@@ -159,7 +250,7 @@ tasks.register('syncLwjglGlueLibs') {
                 zf.getInputStream(entry).withStream { ins ->
                     outFile.withOutputStream { outs -> outs << ins }
                 }
-                println "synced ${soName} (${outFile.length()} bytes)"
+                println "synced ${soName} (${outFile.length()} bytes) -> ${jniDir.name}"
             } finally {
                 zf.close()
             }
@@ -169,6 +260,8 @@ tasks.register('syncLwjglGlueLibs') {
 tasks.named('preBuild').configure { dependsOn('syncLwjglGlueLibs') }
 
 dependencies {
+    // Runtime game-jar bytecode patch (GameJarPatcher: GlesMesh.draw guard).
+    implementation 'org.ow2.asm:asm:9.10.1'
     implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation 'androidx.constraintlayout:constraintlayout:2.2.1'
     implementation 'androidx.activity:activity:1.9.0'

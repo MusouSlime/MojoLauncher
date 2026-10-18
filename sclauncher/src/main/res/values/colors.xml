@@ -24,4 +24,11 @@
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
     <color name="ic_launcher_background">#FF000000</color>
+
+    <!-- Legend of Dragoon menu palette -->
+    <color name="lod_bg">#05070F</color>
+    <color name="lod_gold">#E6C86E</color>
+    <color name="lod_cream">#F3E7C9</color>
+    <color name="lod_border">#8FB0DA</color>
+    <color name="lod_dim">#AEBBD0</color>
 </resources>

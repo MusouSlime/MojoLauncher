@@ -73,8 +73,139 @@ public final class SCLogExporter {
     }
 
     // ------------------------------------------------------------------
+    // Crash recovery.
+    //
+    // The clean-exit exports above never run when the process dies hard
+    // (native VM abort / SIGKILL). To keep a retrievable log anyway, the game
+    // screen writes a small marker when a session starts and deletes it on a
+    // clean exit. If the next launcher start still finds the marker, the
+    // previous session died abruptly, so its logs are exported to
+    // Downloads/Reports as a crash-recovery report.
+    // ------------------------------------------------------------------
+
+    /** Marker written when a game session starts, cleared on a clean exit. */
+    public static final String SESSION_MARKER = ".game_session_active";
+
+    /** Called when the game screen starts: remembers which log a hard kill should keep. */
+    public static void beginGameSession(Context ctx) {
+        if (ctx == null) return;
+        try {
+            File marker = new File(ctx.getFilesDir(), SESSION_MARKER);
+            File log = LogFile.getLogFile();
+            File latest = new File(ctx.getFilesDir(), "latestlog.txt");
+            String body = (log != null ? log.getAbsolutePath() : "") + "\n"
+                    + latest.getAbsolutePath() + "\n"
+                    + System.currentTimeMillis() + "\n";
+            try (FileOutputStream fos = new FileOutputStream(marker, false)) {
+                fos.write(body.getBytes("UTF-8"));
+                fos.flush();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "beginGameSession failed", e);
+        }
+    }
+
+    /** Called on a clean game exit so the marker can't trigger a false recovery. */
+    public static void endGameSession(Context ctx) {
+        if (ctx == null) return;
+        try {
+            new File(ctx.getFilesDir(), SESSION_MARKER).delete();
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * If a previous game session left its marker behind (hard kill / VM abort),
+     * export that session's launcher log, latestlog and the game's own
+     * debug.log / CRASHLOG to Downloads/Reports, then clear the marker.
+     * Fire-and-forget; safe to call on every launcher start.
+     */
+    public static void exportCrashRecoveryIfNeeded(Context ctx, File gameDir) {
+        final Context app = ctx != null ? ctx.getApplicationContext() : null;
+        if (app == null) return;
+        final File marker = new File(app.getFilesDir(), SESSION_MARKER);
+        if (!marker.exists()) return;
+        new Thread(() -> {
+            try {
+                final String[] lines = readAllText(marker).split("\n");
+                final String prevLogPath = lines.length > 0 ? lines[0].trim() : "";
+                final File prevLog = prevLogPath.isEmpty() ? null : new File(prevLogPath);
+
+                final StringBuilder sb = new StringBuilder();
+                appendHeader(app, sb, "previous game session did not exit cleanly (crash recovery)");
+                appendSection(sb, "previous session log", prevLog);
+                appendSection(sb, "latestlog.txt", new File(app.getFilesDir(), "latestlog.txt"));
+                if (gameDir != null) {
+                    appendSection(sb, "game debug.log", new File(gameDir, "debug.log"));
+                    appendSection(sb, "game crash log", newestFile(gameDir, "CRASHLOG-", ".log"));
+                }
+                withTrail(sb);
+
+                final String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+                final String filename = "report_" + stamp + "_crash-recovery.log";
+                final String where = writeReport(app, filename, sb.toString());
+                LogFile.log("Crash-recovery report saved: " + where);
+            } catch (Exception e) {
+                Log.e(TAG, "Crash-recovery export failed", e);
+            } finally {
+                marker.delete();
+            }
+        }, "SCLogRecovery").start();
+    }
+
+    // ------------------------------------------------------------------
     // Internals.
     // ------------------------------------------------------------------
+
+    private static void appendHeader(Context ctx, StringBuilder sb, String reason) {
+        sb.append("=== SCLauncher Session Report ===\n");
+        sb.append("Time: ").append(new Date()).append("\n");
+        sb.append("Reason: ").append(reason).append("\n");
+        try {
+            android.content.pm.PackageInfo pi = ctx.getPackageManager()
+                    .getPackageInfo(ctx.getPackageName(), 0);
+            sb.append("App: ").append(ctx.getPackageName())
+              .append(" v").append(pi.versionName)
+              .append(" (").append(pi.versionCode).append(")\n");
+        } catch (Exception ignored) {}
+        sb.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL)
+          .append(", Android ").append(Build.VERSION.RELEASE)
+          .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
+        try {
+            sb.append(SCGpuInfo.summary()).append("\n");
+        } catch (Exception ignored) {}
+        sb.append("\n");
+    }
+
+    private static void appendSection(StringBuilder sb, String label, File f) {
+        if (f == null || !f.exists()) return;
+        sb.append("--- ").append(label).append(": ").append(f.getName()).append(" ---\n");
+        sb.append(readTail(f)).append("\n");
+    }
+
+    private static File newestFile(File dir, String prefix, String suffix) {
+        File best = null;
+        File[] files = dir != null ? dir.listFiles() : null;
+        if (files != null) {
+            for (File f : files) {
+                String n = f.getName();
+                if (n.startsWith(prefix) && n.endsWith(suffix)
+                        && (best == null || f.lastModified() > best.lastModified())) {
+                    best = f;
+                }
+            }
+        }
+        return best;
+    }
+
+    private static String readAllText(File f) {
+        try (RandomAccessFile raf = new RandomAccessFile(f, "r")) {
+            byte[] buf = new byte[(int) Math.min(raf.length(), 4096)];
+            raf.readFully(buf);
+            return new String(buf, "UTF-8");
+        } catch (Exception e) {
+            return "";
+        }
+    }
 
     private static void exportNow(Context ctx, String reason) {
         if (!sExporting.compareAndSet(false, true)) return;

@@ -13,5 +13,9 @@
         <item name="windowActionBar">false</item>
         <item name="windowNoTitle">true</item>
         <item name="android:windowFullscreen">true</item>
+        <!-- Draw through the camera cutout so the game surface spans the
+             true display width (otherwise widescreen content is pillarboxed
+             by the cutout inset). Runtime also sets this in SCGameActivity. -->
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
     </style>
 </resources>
