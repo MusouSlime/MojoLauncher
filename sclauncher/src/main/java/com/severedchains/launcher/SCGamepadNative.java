@@ -87,6 +87,16 @@ public class SCGamepadNative {
         Log.i(TAG, "virtual pad detached for physical controller");
     }
 
+    /**
+     * True once the virtual pad is attached and can carry input. Callers use
+     * this to decide whether a keyboard mirror is needed: the gamepad path is
+     * the primary one, and sending both reaches the game twice (menus move two
+     * steps per press).
+     */
+    public static boolean isAttached() {
+        return sInstance >= 0;
+    }
+
     private static native int nativeAttach();
 
     private static native void nativeBindVibration();

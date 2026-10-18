@@ -115,6 +115,11 @@ public class SCPhysicalGamepad {
 
         Integer btn = BUTTONS.get(kc);
         Integer axisKey = AXIS_KEYS.get(kc);
+        // The gamepad is the primary path; its keyboard mirror is only a
+        // fallback for when the virtual pad could not attach, otherwise the game
+        // receives each controller press twice (gamepad + key) and menus move
+        // two steps per press.
+        final boolean mirrorToKeys = !SCGamepadNative.isAttached();
         if (action == KeyEvent.ACTION_DOWN) {
             if (e.getRepeatCount() == 0) {
                 if (btn != null && sPressedButtons.add(kc)) {
@@ -123,7 +128,9 @@ public class SCPhysicalGamepad {
                 if (axisKey != null && sPressedAxisKeys.add(kc)) {
                     SCGamepadNative.setAxis(axisKey, 32767);
                 }
-                sendSdlKey(kc, true);
+                if (mirrorToKeys) {
+                    sendSdlKey(kc, true);
+                }
             }
             return true;
         } else if (action == KeyEvent.ACTION_UP) {
@@ -138,7 +145,9 @@ public class SCPhysicalGamepad {
                     || kc == KeyEvent.KEYCODE_DPAD_LEFT || kc == KeyEvent.KEYCODE_DPAD_RIGHT) {
                 clearHat();
             }
-            sendSdlKey(kc, false);
+            if (mirrorToKeys) {
+                sendSdlKey(kc, false);
+            }
             return true;
         } else if (action == KeyEvent.ACTION_MULTIPLE) {
             return true;

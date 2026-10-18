@@ -16,7 +16,7 @@ plugins {
 def targetAbi = (project.findProperty('targetAbi') ?: 'arm64-v8a')
 def isX64 = targetAbi == 'x86_64'
 def isLite = project.hasProperty('lite') && (project.property('lite').toString().toLowerCase() in ['true', '1', 'yes'])
-def baseVersionName = isX64 ? "1.0.36-assertfix-x86_64" : "1.0.36-assertfix"
+def baseVersionName = isX64 ? "1.0.37-inputfix-x86_64" : "1.0.37-inputfix"
 def apkBaseName = isLite
         ? (isX64 ? 'sclauncher-lite-x86_64-debug.apk' : 'sclauncher-lite-debug.apk')
         : (isX64 ? 'sclauncher-x86_64-debug.apk' : 'sclauncher-sclauncher-debug.apk')
@@ -34,7 +34,7 @@ android {
         applicationId isLite ? "com.severedchains.launcher.lite" : "com.severedchains.launcher"
         minSdkVersion 21
         targetSdkVersion 36
-        versionCode 20261049
+        versionCode 20261050
         versionName isLite ? baseVersionName + "-lite" : baseVersionName
         multiDexEnabled false
         ndk {

@@ -616,26 +616,45 @@ public class TouchGamepadView extends View {
     private void press(Button btn, int pointerId) {
         btn.setPressed(true, pointerId);
         mActiveTouches.add(btn);
-        sendKeyEvent(btn.keyCode, true);
+        // Gamepad FIRST: attaching the virtual pad happens here, and isAttached()
+        // below then reflects whether the pad actually took the input.
         sendPadButton(btn.padButton, true);
         sendPadAxis(btn.padAxis, true);
+        sendKeyEventIfNoPad(btn.keyCode, true);
     }
 
     private void release(Button btn) {
-        sendKeyEvent(btn.keyCode, false);
+        sendKeyEventIfNoPad(btn.keyCode, false);
         sendPadButton(btn.padButton, false);
         sendPadAxis(btn.padAxis, false);
         btn.setPressed(false, -1);
         mActiveTouches.remove(btn);
     }
 
+    /**
+     * Keyboard mirror of a pad button, used ONLY while the virtual gamepad is
+     * unavailable (attach failed, or a controller-less build). It used to be
+     * sent unconditionally, which was invisible while SDLActivity.onNativeKeyDown
+     * was being handed pre-converted SDL keycodes (the game resolved nothing and
+     * dropped them). Now that the keycodes are correct the game gets every press
+     * TWICE -- once as a gamepad button and once as a key -- and menus move two
+     * steps per press.
+     */
+    private void sendKeyEventIfNoPad(int keyCode, boolean down) {
+        if (SCGamepadNative.isAttached()) return;
+        sendKeyEvent(keyCode, down);
+    }
+
     private void sendKeyEvent(int keyCode, boolean down) {
-        JVMRunner.queueKeyEvent(keyCode, down);
         // SDLActivity.onNativeKeyDown/Up take an ANDROID keycode (that is what
         // SDL's own Android layer feeds them) and map it to an SDL key
         // internally. Handing them a pre-converted SDL keycode made the game
         // receive an unusable keycode and drop the event ("Unknown key" in the
         // game log), so the keyboard mirror of the pad was dead.
+        //
+        // NOTE: this used to also call JVMRunner.queueKeyEvent(), which fed a
+        // queue nothing ever polls and logged a line to the log file on every
+        // single press. Removed.
         try {
             if (down) git.mojo.sdl.SDLActivity.onNativeKeyDown(keyCode);
             else git.mojo.sdl.SDLActivity.onNativeKeyUp(keyCode);
