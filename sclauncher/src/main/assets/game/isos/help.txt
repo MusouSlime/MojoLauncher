@@ -1,2 +1,0 @@
-Place your Legend of Dragoon disc images here as disc1.bin, disc2.bin, disc3.bin, disc4.bin
-Select all four at once with Pick Disc Images (selection order maps to disc 1-4).

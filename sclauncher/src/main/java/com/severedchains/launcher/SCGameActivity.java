@@ -656,6 +656,19 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
             SDLActivity.nativeVisibilityChanged(false);
         } catch (Throwable ignored) {}
         SCLogger.appendToLog("activity paused");
+        // A pause is not a crash. Clear the hard-kill marker so that pressing
+        // Home / Recents, or the OS killing the backgrounded app, doesn't turn
+        // into a false "previous session did not exit cleanly" report.
+        SCLogExporter.endGameSession(getApplicationContext());
+        SCLogger.appendToLog("session marker cleared on pause (not a crash)");
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        // Belt-and-braces: some OEMs can stop without delivering onPause to the
+        // same process state. A stopped game is not a foreground crash.
+        SCLogExporter.endGameSession(getApplicationContext());
     }
 
     @Override
@@ -667,6 +680,10 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
             SDLActivity.nativeVisibilityChanged(true);
         } catch (Throwable ignored) {}
         SCLogger.appendToLog("activity resumed");
+        // We are foreground again: re-arm the marker so a genuine VM abort /
+        // SIGKILL while playing is still exported as crash recovery.
+        SCLogExporter.beginGameSession(getApplicationContext());
+        SCLogger.appendToLog("session marker re-armed on resume");
         syncGamepadVisibility();
         // Bars/cutout may reappear around a resume and change the usable
         // surface; re-forward once the relayout settles.

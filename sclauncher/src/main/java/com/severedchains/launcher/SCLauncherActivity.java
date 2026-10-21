@@ -355,27 +355,29 @@ public class SCLauncherActivity extends AppCompatActivity {
     // version marker so upgrades wipe stale jars but keep isos/ + saves/.
     // ------------------------------------------------------------------
     private void extractBundledGameFiles() {
-        File markerV4 = new File(gameDir, ".bundled_extracted_v4");
-        if (markerV4.exists()) {
-            LogFile.log("Bundled game files already extracted (v4)");
+        File markerV5 = new File(gameDir, ".bundled_extracted_v5");
+        if (markerV5.exists()) {
+            LogFile.log("Bundled game files already extracted (v5, SC 3.0)");
             extractSclauncherNatives();
             extractGpuVariants();
             applyGpuShaderVariant();
             refreshAll();
             return;
         }
-        // v1/v2/v3 -> v4 upgrade: refresh bundle (e.g. patched AudioThread:
-        // OpenAL10 caps check bypassed, mobile OpenAL-Soft never reports it).
-        // Preserve user data (isos/, saves/).
+        // v1/v2/v3/v4 -> v5 upgrade: refresh the whole game bundle to the
+        // SC 3.0 jar/assets (the old snapshot is missing 3.0 event classes),
+        // preserving user data (isos/, saves/, mods/, configs, files/).
         File markerV1 = new File(gameDir, ".bundled_extracted");
         File markerV2 = new File(gameDir, ".bundled_extracted_v2");
         File markerV3 = new File(gameDir, ".bundled_extracted_v3");
-        if (markerV1.exists() || markerV2.exists() || markerV3.exists()) {
-            LogFile.log("Upgrading game bundle to v4, preserving isos/ + saves/");
+        File markerV4 = new File(gameDir, ".bundled_extracted_v4");
+        if (markerV1.exists() || markerV2.exists() || markerV3.exists() || markerV4.exists()) {
+            LogFile.log("Upgrading game bundle to v5 (SC 3.0), preserving user data");
             preserveAndWipeGameDir();
             markerV1.delete();
             markerV2.delete();
             markerV3.delete();
+            markerV4.delete();
         }
         LogFile.log("Extracting bundled game files from assets...");
         statusText.setText("Extracting game files (first run)...");
@@ -388,8 +390,8 @@ public class SCLauncherActivity extends AppCompatActivity {
                 try {
                     gameDir.mkdirs();
                     extractAssetsDir("game", gameDir);
-                    markerV4.createNewFile();
-                    LogFile.log("Bundled game files extracted to " + gameDir.getAbsolutePath());
+                    markerV5.createNewFile();
+                    LogFile.log("Bundled game files (SC 3.0) extracted to " + gameDir.getAbsolutePath());
                     extractSclauncherNatives();
                     extractGpuVariants();
                     applyGpuShaderVariant();
@@ -648,34 +650,40 @@ public class SCLauncherActivity extends AppCompatActivity {
      * bump makes the game rebuild files/ itself.
      */
     private void preserveAndWipeGameDir() {
-        File isos = new File(gameDir, "isos");
-        File saves = new File(gameDir, "saves");
+        // Bundle upgrades must not destroy user state. Keep the unpacked data
+        // (files/) in place because copying it through cache would need GBs,
+        // and round-trip the small user-owned items through cache.
+        final String[] preserve = {
+                "isos", "saves", "mods",
+                "config.conf", "config.dcnf", "campaign_config.dcnf"
+        };
         File tmpRoot = new File(getCacheDir(), "game_upgrade_tmp");
         deleteRecursive(tmpRoot);
         tmpRoot.mkdirs();
-        try {
-            if (isos.exists()) copyRecursive(isos, new File(tmpRoot, "isos"));
-            if (saves.exists()) copyRecursive(saves, new File(tmpRoot, "saves"));
-        } catch (Exception e) {
-            LogFile.error("Failed to preserve isos/saves", e);
+        for (final String name : preserve) {
+            final File src = new File(gameDir, name);
+            if (!src.exists()) continue;
+            try {
+                copyRecursive(src, new File(tmpRoot, name));
+            } catch (Exception e) {
+                LogFile.error("Failed to preserve " + name, e);
+            }
         }
         File[] children = gameDir.listFiles();
         if (children != null) {
             for (File child : children) {
-                // Keep the unpacked data in place: copying it through cache
-                // would need GBs and a slow move; deleting it would force a
-                // full re-rip on the next launch.
                 if ("files".equals(child.getName())) continue;
                 deleteRecursive(child);
             }
         }
-        try {
-            File keptIsos = new File(tmpRoot, "isos");
-            File keptSaves = new File(tmpRoot, "saves");
-            if (keptIsos.exists()) copyRecursive(keptIsos, isos);
-            if (keptSaves.exists()) copyRecursive(keptSaves, saves);
-        } catch (Exception e) {
-            LogFile.error("Failed to restore isos/saves", e);
+        for (final String name : preserve) {
+            final File kept = new File(tmpRoot, name);
+            if (!kept.exists()) continue;
+            try {
+                copyRecursive(kept, new File(gameDir, name));
+            } catch (Exception e) {
+                LogFile.error("Failed to restore " + name, e);
+            }
         }
         deleteRecursive(tmpRoot);
         // Saves live outside gameDir (symlink); re-establish after wipe.
@@ -1075,6 +1083,7 @@ public class SCLauncherActivity extends AppCompatActivity {
         menu.getMenu().add(0, 30, order++, "Import Mod Jar…");
         menu.getMenu().add(0, 35, order++, "Import Mod Zip…");
         menu.getMenu().add(0, 34, order++, "Import Mod Folder…");
+        menu.getMenu().add(0, 32, order++, "Mod Manager…");
         menu.getMenu().add(0, 31, order++, "App Folder (mods)…");
         menu.getMenu().add(0, 40, order++, loadHandheldMode() ? "Handheld Mode ✓" : "Handheld Mode");
         menu.getMenu().add(0, 41, order++, loadTouchPad() ? "Dragoon Pad ✓" : "Dragoon Pad");
@@ -1121,6 +1130,9 @@ public class SCLauncherActivity extends AppCompatActivity {
                 return true;
             } else if (id == 31) {
                 showAppFolderDialog();
+                return true;
+            } else if (id == 32) {
+                showModManagerDialog();
                 return true;
             } else if (id == 40) {
                 setHandheldMode(!loadHandheldMode());
@@ -1635,6 +1647,104 @@ public class SCLauncherActivity extends AppCompatActivity {
                 .setNegativeButton("Close", null)
                 .show();
         SCActionTrail.record("App folder dialog opened");
+    }
+
+    /**
+     * Lists everything in {@code gameDir/mods/}: top-level mod jars plus any
+     * data folders they ship with, and lets the user delete an entry. Deleting
+     * a jar unloads the mod on the next launch; the game has no runtime unload
+     * API. This is a filesystem view because the mod-loader's enabled/known
+     * lists live in the binary config.dcnf.
+     */
+    private void showModManagerDialog() {
+        if (gameDir == null) return;
+        final File modsDir = new File(gameDir, "mods");
+        final File[] entries = modsDir.listFiles();
+        if (entries == null || entries.length == 0) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Mod Manager")
+                    .setMessage("No mods installed.\n\nMods live in:\n"
+                            + modsDir.getAbsolutePath()
+                            + "\n\nUse Import Mod Jar/Zip/Folder to add one.")
+                    .setPositiveButton("Close", null)
+                    .setNeutralButton("Import Mod Jar…",
+                            (d, w) -> mImportModJarLauncher.launch("*/*"))
+                    .show();
+            SCActionTrail.record("Mod manager opened (empty)");
+            return;
+        }
+
+        Arrays.sort(entries, (a, b) -> {
+            if (a.isDirectory() != b.isDirectory()) return a.isDirectory() ? -1 : 1;
+            return a.getName().compareToIgnoreCase(b.getName());
+        });
+
+        final String[] labels = new String[entries.length];
+        for (int i = 0; i < entries.length; i++) {
+            final File f = entries[i];
+            final String kind;
+            final String size;
+            if (f.isDirectory()) {
+                kind = "[data]";
+                size = "data folder";
+            } else {
+                kind = f.getName().toLowerCase(java.util.Locale.US).endsWith(".jar")
+                        ? "[mod] " : "[file]";
+                size = android.text.format.Formatter.formatShortFileSize(this, f.length());
+            }
+            labels[i] = kind + "  " + f.getName() + "  (" + size + ")";
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("Mod Manager (" + entries.length + ")")
+                .setItems(labels, (d, which) -> confirmRemoveMod(entries[which]))
+                .setPositiveButton("Close", null)
+                .setNeutralButton("Import Mod Jar…",
+                        (d, w) -> mImportModJarLauncher.launch("*/*"))
+                .show();
+        SCActionTrail.record("Mod manager opened (" + entries.length + " entries)");
+    }
+
+    private void confirmRemoveMod(final File entry) {
+        final boolean dir = entry.isDirectory();
+        final String what = dir ? "data folder" : "mod";
+        new AlertDialog.Builder(this)
+                .setTitle("Remove " + what + "?")
+                .setMessage(entry.getName() + "\n\n"
+                        + (dir
+                        ? "This deletes the folder and everything in it."
+                        : "The mod will no longer load on the next launch."))
+                .setPositiveButton("Remove", (d, w) -> removeModEntry(entry))
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void removeModEntry(final File entry) {
+        new Thread(() -> {
+            final boolean ok = deleteRecursively(entry);
+            final String msg = ok
+                    ? "Removed " + entry.getName()
+                    : "Could not remove " + entry.getName();
+            uiHandler.post(() -> {
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+                statusText.setText(msg);
+                LogFile.log(msg);
+                SCActionTrail.record(msg);
+                refreshAll();
+            });
+        }, "SCModRemove").start();
+    }
+
+    private static boolean deleteRecursively(final File file) {
+        if (file.isDirectory()) {
+            final File[] children = file.listFiles();
+            if (children != null) {
+                for (final File child : children) {
+                    if (!deleteRecursively(child)) return false;
+                }
+            }
+        }
+        return file.delete();
     }
 
     private void refreshAll() {

@@ -319,6 +319,13 @@ public final class GameJarPatcher {
     private static final String TRANSFORMATIONS_ENTRY = "legend/core/Transformations.class";
     private static final String TRANSFORMATIONS_OWNER = "legend/core/Transformations";
     private static final String TEXT_ENTRY = "legend/game/Text.class";
+    private static final String UPDATER_ENTRY = "legend/core/Updater.class";
+    /**
+     * The stock SC updater downloads the desktop Linux ARM64 build and would
+     * replace the Android-patched jar/assets. Keep the in-game check inert;
+     * launcher/APK updates are handled separately.
+     */
+    private static final boolean ENABLE_UPDATER_DISABLE = true;
     private static final String GAMEENGINE_OWNER = "legend/core/GameEngine";
     private static final String QUEUEDMODEL_DESC = "Llegend/core/renderer/QueuedModel;";
     private static final String RENDERMODE_DESC = "Llegend/game/EngineState$RenderMode;";
@@ -343,6 +350,7 @@ public final class GameJarPatcher {
     private static final int PATCHED_SCISSORSTACK = 1024;
     private static final int PATCHED_TRANSFORMATIONS = 2048;
     private static final int PATCHED_TEXT_SCISSOR = 4096;
+    private static final int PATCHED_UPDATER = 8192;
 
     private GameJarPatcher() {}
 
@@ -592,6 +600,10 @@ public final class GameJarPatcher {
                 if (msg.length() > 0) msg.append(" + ");
                 msg.append("glyph scissors off (test)");
             }
+            if ((patched & PATCHED_UPDATER) != 0) {
+                if (msg.length() > 0) msg.append(" + ");
+                msg.append("in-game updater disabled");
+            }
             if ((patched & PATCHED_GENERICSPRITE) != 0) {
                 if (msg.length() > 0) msg.append(" + ");
                 msg.append("effect sprites opaque (test)");
@@ -601,6 +613,43 @@ public final class GameJarPatcher {
             tmp.delete();
             return new Result(false, "patch failed: " + t);
         }
+    }
+
+    /**
+     * Updater: replace {@code check(Consumer)} with a straight
+     * {@code onComplete.accept(null); return;}, so the launcher-deployed game
+     * never offers to install the desktop build over itself.
+     */
+    private static byte[] transformUpdater(final byte[] input) {
+        final ClassReader reader = new ClassReader(input);
+        final ClassWriter writer = new ClassWriter(reader, ClassWriter.COMPUTE_MAXS);
+        final ClassVisitor visitor = new ClassVisitor(Opcodes.ASM9, writer) {
+            @Override
+            public MethodVisitor visitMethod(final int access, final String name, final String descriptor,
+                                             final String signature, final String[] exceptions) {
+                final MethodVisitor delegate = super.visitMethod(access, name, descriptor, signature, exceptions);
+                if (!"check".equals(name) || !"(Ljava/util/function/Consumer;)V".equals(descriptor)) {
+                    return delegate;
+                }
+
+                return new MethodVisitor(Opcodes.ASM9) {
+                    @Override
+                    public void visitCode() {
+                        delegate.visitCode();
+                        delegate.visitVarInsn(Opcodes.ALOAD, 1);
+                        delegate.visitInsn(Opcodes.ACONST_NULL);
+                        delegate.visitMethodInsn(Opcodes.INVOKEINTERFACE,
+                                "java/util/function/Consumer", "accept",
+                                "(Ljava/lang/Object;)V", true);
+                        delegate.visitInsn(Opcodes.RETURN);
+                        delegate.visitMaxs(2, 2);
+                        delegate.visitEnd();
+                    }
+                };
+            }
+        };
+        reader.accept(visitor, 0);
+        return writer.toByteArray();
     }
 
     private static int transformJar(final File in, final File out,
@@ -658,6 +707,9 @@ public final class GameJarPatcher {
                 } else if (ENABLE_GLYPH_SCISSOR_BYPASS && TEXT_ENTRY.equals(entry.getName())) {
                     patched |= PATCHED_TEXT_SCISSOR;
                     zos.write(transformTextGlyphScissors(readAll(zis)));
+                } else if (ENABLE_UPDATER_DISABLE && UPDATER_ENTRY.equals(entry.getName())) {
+                    patched |= PATCHED_UPDATER;
+                    zos.write(transformUpdater(readAll(zis)));
                 } else {
                     int n;
                     while ((n = zis.read(buf)) != -1) {
