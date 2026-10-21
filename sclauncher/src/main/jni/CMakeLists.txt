@@ -21,10 +21,11 @@ add_library(sc_sdlprobe SHARED sc_sdlprobe.c)
 
 add_library(sc_sdlassert SHARED sc_sdlassert.c)
 
-# NOTE: absolute SDL include path is a local-machine path (this dev box).
-# sc_gamepad only needs it at compile time; runtime resolution is via dlsym.
+# sc_gamepad only needs the SDL headers at compile time; runtime resolution
+# is via dlsym. Keep the path relative to this file so CI and local builds use
+# the checked-out sdl/ submodule (<repo>/sdl/include) instead of a dev-box path.
 target_include_directories(sc_gamepad PRIVATE
-    /var/home/user/Projects/SCLauncher/MojoLauncher/sdl/include
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../sdl/include"
 )
 
 target_link_libraries(sc_gamepad
