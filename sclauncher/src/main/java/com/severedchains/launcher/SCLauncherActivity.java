@@ -1430,6 +1430,7 @@ public class SCLauncherActivity extends AppCompatActivity {
                 // Pass 2: extract.
                 int files = 0;
                 int jars = 0;
+                int skipped = 0;
                 long total = 0;
                 try (InputStream in = openZip(uri);
                      ZipInputStream zis = new ZipInputStream(in)) {
@@ -1445,6 +1446,7 @@ public class SCLauncherActivity extends AppCompatActivity {
 
                         if (name.contains("..") || name.contains("//") || name.indexOf(':') >= 0) {
                             LogFile.log("Mod zip: skipped unsafe entry '" + e.getName() + "'");
+                            skipped++;
                             continue;
                         }
                         // Nested jars are kept rather than skipped: mods ship helper
@@ -1452,6 +1454,7 @@ public class SCLauncherActivity extends AppCompatActivity {
                         final File dst = new File(modsDir, name);
                         if (!dst.getCanonicalPath().startsWith(modsRoot + File.separator)) {
                             LogFile.log("Mod zip: blocked path escape '" + e.getName() + "'");
+                            skipped++;
                             continue;
                         }
                         // The declared entry size is only a hint (it is -1 for streamed
@@ -1493,9 +1496,12 @@ public class SCLauncherActivity extends AppCompatActivity {
 
                 final String msg = "Unzipped " + files + " file(s) into mods/"
                         + (jars > 0 ? " (" + jars + " mod jar at top level)" : " — no top-level .jar found")
+                        + (skipped > 0 ? " — " + skipped + " entr(ies) SKIPPED, the mod is incomplete" : "")
                         + " — enable at New Campaign → Mods.";
                 LogFile.log(msg);
-                SCActionTrail.record("Mod zip unzipped: " + files + " files");
+                SCActionTrail.record("Mod zip unzipped: " + files + " files"
+                        + (skipped > 0 ? ", " + skipped + " skipped" : ""));
+                logModScriptLayout(modsDir);
                 uiHandler.post(() -> {
                     statusText.setText(msg);
                     Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
@@ -1522,6 +1528,56 @@ public class SCLauncherActivity extends AppCompatActivity {
      * Returns {@code "name/"} when every entry sits under one common top-level
      * folder, else null (the archive root is used as-is).
      */
+    /**
+     * Log the script layout of every installed mod, and warn about entries the
+     * game cannot load.
+     *
+     * <p>The game's mod script loader loads
+     * {@code mods/<mod>/scripts/<group>/<id>} as a <b>directory</b>
+     * ({@code Loader.loadDirectory}). A missing id surfaces only as a
+     * {@code NoSuchFileException} deep inside the game, one line per attempt,
+     * with no indication of which mod was at fault — which is exactly how a
+     * broken mod (a {@code scripts/battle/4997} that never made it into the
+     * zip, or an id shipped as a plain file) shows up in a device report.
+     *
+     * <p>Logging the layout at import time makes the next report
+     * self-diagnosing, and the id check catches the "shipped as a file" case
+     * up front instead of thousands of lines into a session.
+     */
+    private static void logModScriptLayout(final File modsDir) {
+        final File[] mods = modsDir.listFiles();
+        if (mods == null) return;
+
+        for (final File mod : mods) {
+            if (!mod.isDirectory()) continue;
+
+            final File scripts = new File(mod, "scripts");
+            final File[] groups = scripts.listFiles();
+            if (groups == null) {
+                LogFile.log("Mod layout: " + mod.getName() + " has no scripts/ directory");
+                continue;
+            }
+
+            for (final File group : groups) {
+                if (!group.isDirectory()) continue;
+                final File[] ids = group.listFiles();
+                final int idCount = ids == null ? 0 : ids.length;
+                LogFile.log("Mod layout: " + mod.getName() + " scripts/" + group.getName()
+                        + " — " + idCount + " id(s)");
+
+                if (ids == null) continue;
+                for (final File id : ids) {
+                    if (!id.isFile()) continue;
+                    // The game loads a script id as a directory; a plain file
+                    // here makes every load of that id fail.
+                    LogFile.log("Mod layout WARNING: " + mod.getName() + " scripts/" + group.getName() + "/"
+                            + id.getName() + " is a file, but the game loads script ids as directories — "
+                            + "this id will fail to load");
+                }
+            }
+        }
+    }
+
     private static String commonRootFolder(final List<String> names) {
         String root = null;
         for (final String n : names) {

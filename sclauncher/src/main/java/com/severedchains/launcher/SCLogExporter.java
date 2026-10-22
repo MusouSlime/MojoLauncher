@@ -210,6 +210,12 @@ public final class SCLogExporter {
     private static void exportNow(Context ctx, String reason) {
         if (!sExporting.compareAndSet(false, true)) return;
         try {
+            // Make sure the repeat tally is in the file before its tail is
+            // read, otherwise the report would not say how many lines the
+            // log collapsing suppressed.
+            LogFile.writeTally();
+            LogFile.flush();
+
             String safeReason = reason == null ? "close"
                     : reason.replaceAll("[^A-Za-z0-9_-]", "_");
             String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());

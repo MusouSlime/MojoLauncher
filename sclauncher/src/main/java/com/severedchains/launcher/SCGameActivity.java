@@ -477,10 +477,17 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
             android.system.Os.setenv("LIBGL_NOINTOVLHACK", "1", true);
             android.system.Os.setenv("LIBGL_NORMALIZE", "1", true);
             android.system.Os.setenv("MESA_GLSL_CACHE_DIR", getCacheDir().getAbsolutePath(), true);
-            // OpenAL-Soft: Oboe/AAudio alone reports no OpenAL10 caps on this
-            // device (infinite reinit loop, silence). Prefer classic OpenSL ES
-            // like Mojo's PREF_ALSOFT_FORCE_OPENSL, but keep oboe as fallback
-            // instead of a single forced driver with no second chance.
+            // OpenAL-Soft backend order. Oboe (AAudio) first, OpenSL ES second.
+            // The Oboe backend is the one that actually opens on modern
+            // Android (13 on the Odin2), and it is also the backend whose
+            // device is reported as "Oboe Default"; OpenSL ES is only a
+            // fallback for devices where AAudio refuses to start.
+            //
+            // NOTE: the backend has nothing to do with LWJGL's
+            // ALCapabilities.OpenAL10 flag, which is false on this device
+            // because the bundled libopenal.so does not export LWJGL's own
+            // al*Direct entry points (see the launcher's own audioprobe
+            // output and GameJarPatcher's AudioThread patch).
             android.system.Os.setenv("ALSOFT_DRIVERS", "oboe,opensl", true);
             // OpenAL-Soft diagnostics (backend open/realize failures) go to
             // stderr, which SCLogger already captures to latestlog.txt.

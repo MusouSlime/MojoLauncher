@@ -17,7 +17,7 @@ import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
 
 /**
- * Runtime patcher for the deployed Severed Chains game jar. Three independent,
+ * Runtime patcher for the deployed Severed Chains game jar. Several
  * idempotent, version-independent bytecode patches are applied in one pass:
  *
  * <ol>
@@ -31,7 +31,30 @@ import java.util.zip.ZipOutputStream;
  *   count is a positive value below 3. Line primitives (valid with two
  *   vertices) are untouched, and {@code count == 0} must NEVER be skipped — it
  *   is the "draw everything" sentinel (it delegates to {@code draw()}), the
- *   normal path for models, UI and the FMV quad.</li>
+ *   normal path for models, UI and the FMV quad.
+ *
+ *   <p>The same pass also clamps every triangle draw count down to a whole
+ *   number of primitives, which is what actually silences the driver: the
+ *   message is raised by the <i>trailing partial primitive</i> of a count that
+ *   is not a multiple of 3 (or 6 for {@code GL_TRIANGLES_ADJACENCY}), not by
+ *   the whole count being small. The clamp is rendering-neutral, because the
+ *   driver discards those trailing vertices anyway.</li>
+ *
+ *   <li><b>AudioThread reinit loop</b> — the game's audio thread treated
+ *   LWJGL's {@code ALCapabilities.OpenAL10} flag as "this device cannot do
+ *   OpenAL 1.0", tore the device and context down, and the two-second device
+ *   poll then recreated them, forever. The flag is false whenever the OpenAL
+ *   build does not export LWJGL's own {@code al*Direct} entry points, which
+ *   the stock OpenAL Soft builds do not, while every entry point the game
+ *   actually uses is present and working. The patch redirects that branch to
+ *   the success path and logs one explanatory line.</li>
+ *
+ *   <li><b>GL debug filter</b> — the game passed the GLES2 hint constant
+ *   {@code GL_DONT_CARE} (0x1100) to {@code glDebugMessageControl}, where
+ *   KHR_debug's 0xFFFF belongs; every one of its filter calls was therefore
+ *   answered with INVALID_ENUM and changed nothing. The patch uses the right
+ *   constant and additionally mutes the driver's PERFORMANCE messages (the
+ *   Adreno "Namespace collision detected, using slow path" hint).</li>
  *
  *   <li><b>Unpacker I/O bound (LITE BUILD ONLY)</b> —
  *   {@code legend.game.unpacker.Unpacker} runs its transform and write phases
@@ -80,7 +103,7 @@ public final class GameJarPatcher {
      * "Extended" mode (Forced 4:3 was unaffected because that path never reads
      * {@code expectedWidth}).
      */
-    public static final String MARKER = ".gamejar_patch_v21";
+    public static final String MARKER = ".gamejar_patch_v22";
 
     /**
      * Patch-revision stamp stored in the marker. <b>Change this whenever the
@@ -88,7 +111,7 @@ public final class GameJarPatcher {
      * {@link #fingerprint()} so it cannot be forgotten again). It is logged on
      * every launch, which makes a stale patch visible in a device report.
      */
-    public static final String PATCH_REVISION = "r22";
+    public static final String PATCH_REVISION = "r23";
 
     /** Rewritten {@code expectedWidth} for the retail widescreen branch. */
     private static final int EXPECTED_WIDTH_FROM = 368;
@@ -283,7 +306,51 @@ public final class GameJarPatcher {
     private static final String FIELD_COUNT = "count";
     private static final int GL_TRIANGLES = 4;
     private static final int GL_TRIANGLE_STRIP = 5;
-    private static final int GL_TRIANGLES_ADJACENCY = 12;
+    /**
+     * GL_TRIANGLES_ADJACENCY is <b>0x0008</b> (8), not 0x000C. The old value 12
+     * was the desktop-GL GL_QUADS constant and never matched anything, so the
+     * guard silently never applied to adjacency meshes -- which is exactly
+     * what the TMD models use ({@code TmdObjLoader} builds them with
+     * {@code VertexOrder.TRIANGLES_ADJACENCY}).
+     */
+    private static final int GL_TRIANGLES_ADJACENCY = 8;
+    /** Vertices per GL_TRIANGLES primitive. */
+    private static final int GL_TRIANGLES_VERTS = 3;
+    /** Vertices per GL_TRIANGLES_ADJACENCY primitive (3 + 3 adjacency). */
+    private static final int GL_TRIANGLES_ADJACENCY_VERTS = 6;
+    /** Minimum vertices for a GL_TRIANGLE_STRIP to produce a primitive. */
+    private static final int GL_TRIANGLE_STRIP_MIN = 3;
+    /** Name of the injected helper that clamps a draw count to whole primitives. */
+    private static final String CLAMP_COUNT = "clampCount";
+
+    private static final String AUDIOTHREAD_ENTRY = "legend/core/audio/AudioThread.class";
+    private static final String AUDIOTHREAD_OWNER = "legend/core/audio/AudioThread";
+    private static final String LOGGER_FIELD = "LOGGER";
+    private static final String LOGGER_DESC = "Lorg/apache/logging/log4j/Logger;";
+    private static final String ALCAPS_OWNER = "org/lwjgl/openal/ALCapabilities";
+    private static final String ALCAPS_OPENAL10 = "OpenAL10";
+
+    private static final String GLESAPI_DEBUG_ENTRY = "legend/core/renderer/opengles/GlesApi.class";
+    private static final String GLES32_OWNER = "org/lwjgl/opengles/GLES32";
+    /**
+     * KHR_debug's "don't care" filter is 0xFFFF. The game passes
+     * {@code GLES20.GL_DONT_CARE}, which is the <b>GLES2 hint</b> constant
+     * 0x1100 -- not a valid source, type or severity for
+     * {@code glDebugMessageControl}. The driver answers INVALID_ENUM and
+     * changes nothing, so all four of the game's filter calls were no-ops and
+     * the driver kept its default state (everything except NOTIFICATION).
+     */
+    private static final int GLES_DONT_CARE_KHR = 0xFFFF;
+    /**
+     * {@code GLES20.GL_DONT_CARE} (0x1100) -- the GLES2 <i>hint</i>
+     * constant, which the game passes to {@code glDebugMessageControl} where
+     * KHR_debug's 0xFFFF belongs.
+     */
+    private static final int GLES2_DONT_CARE_HINT = 0x1100;
+    /** GL_DEBUG_TYPE_PERFORMANCE -- Adreno's "Namespace collision" hint. */
+    private static final int GL_DEBUG_TYPE_PERFORMANCE = 0x8250;
+    /** JVM type code for {@code int[]} (NEWARRAY operand). */
+    private static final int T_INT = 10;
 
     private static final String UNPACKER_ENTRY = "legend/game/unpacker/Unpacker.class";
     private static final String EXECUTORS = "java/util/concurrent/Executors";
@@ -351,6 +418,8 @@ public final class GameJarPatcher {
     private static final int PATCHED_TRANSFORMATIONS = 2048;
     private static final int PATCHED_TEXT_SCISSOR = 4096;
     private static final int PATCHED_UPDATER = 8192;
+    private static final int PATCHED_AUDIOTHREAD = 16384;
+    private static final int PATCHED_GLESAPI_DEBUG = 32768;
 
     private GameJarPatcher() {}
 
@@ -448,6 +517,10 @@ public final class GameJarPatcher {
                 ENABLE_WIDESCREEN_DIAG, ENABLE_GLYPH_SCISSOR_BYPASS,
                 EXPECTED_WIDTH_FROM, EXPECTED_WIDTH_TO,
                 GL_TRIANGLES, GL_TRIANGLES_ADJACENCY, UNPACK_THREADS,
+                GL_TRIANGLE_STRIP, GL_TRIANGLES_VERTS,
+                GL_TRIANGLES_ADJACENCY_VERTS, GL_TRIANGLE_STRIP_MIN,
+                GLES_DONT_CARE_KHR, GLES2_DONT_CARE_HINT,
+                GL_DEBUG_TYPE_PERFORMANCE,
         });
         return Integer.toHexString(h);
     }
@@ -552,6 +625,14 @@ public final class GameJarPatcher {
             final StringBuilder msg = new StringBuilder();
             if ((patched & PATCHED_GLESMESH) != 0) {
                 msg.append("GlesMesh.draw guard");
+            }
+            if ((patched & PATCHED_AUDIOTHREAD) != 0) {
+                if (msg.length() > 0) msg.append(" + ");
+                msg.append("AudioThread reinit loop stopped");
+            }
+            if ((patched & PATCHED_GLESAPI_DEBUG) != 0) {
+                if (msg.length() > 0) msg.append(" + ");
+                msg.append("GL debug filter fixed (KHR don't-care)");
             }
             if ((patched & PATCHED_UNPACKER) != 0) {
                 if (msg.length() > 0) msg.append(" + ");
@@ -667,6 +748,12 @@ public final class GameJarPatcher {
                 if (GLESMESH_ENTRY.equals(entry.getName())) {
                     patched |= PATCHED_GLESMESH;
                     zos.write(transformGlesMesh(readAll(zis)));
+                } else if (AUDIOTHREAD_ENTRY.equals(entry.getName())) {
+                    patched |= PATCHED_AUDIOTHREAD;
+                    zos.write(transformAudioThread(readAll(zis)));
+                } else if (GLESAPI_DEBUG_ENTRY.equals(entry.getName())) {
+                    patched |= PATCHED_GLESAPI_DEBUG;
+                    zos.write(transformGlesApiDebug(readAll(zis)));
                 } else if (boundUnpacker && UNPACKER_ENTRY.equals(entry.getName())) {
                     patched |= PATCHED_UNPACKER;
                     zos.write(transformUnpacker(readAll(zis)));
@@ -724,7 +811,33 @@ public final class GameJarPatcher {
         return patched;
     }
 
-    /** GlesMesh: inject the degenerate-triangle early return at method entry. */
+    /**
+     * GlesMesh: two related fixes for the Adreno driver's
+     * "unable to generate a triangle primitive because there are less than 3
+     * vertices" complaint.
+     *
+     * <ol>
+     *   <li><b>Clamp the draw count to whole primitives.</b> The driver
+     *   validates every primitive it is handed. A triangle list whose vertex
+     *   count is not a multiple of 3 (or a multiple of 6 for
+     *   {@code GL_TRIANGLES_ADJACENCY}) ends in a partial primitive with fewer
+     *   than three vertices, and the driver reports that as a high-severity
+     *   debug message. The trailing vertices are discarded by the driver
+     *   anyway, so rounding the count <i>down</i> to the nearest whole
+     *   primitive is rendering-neutral and silences the driver.
+     *
+     *   <p>The clamp is injected at the {@code glDrawArrays} call site as
+     *   {@code clampCount(count, mode)}: the count is already on the operand
+     *   stack there, so pushing {@code this.mode} on top of it hands the
+     *   helper exactly the two values it needs without touching any local.
+     *
+     *   <li><b>Skip degenerate draws outright.</b> A count below the primitive
+     *   size clamps to zero, which is already a legal no-op draw, so the
+     *   early return at method entry is kept only for the
+     *   {@code GL_TRIANGLE_STRIP} case, where a count below 3 cannot be
+     *   rounded down to a whole primitive.
+     * </ol>
+     */
     private static byte[] transformGlesMesh(final byte[] input) {
         final ClassReader reader = new ClassReader(input);
         final ClassWriter writer = new ClassWriter(reader,
@@ -776,6 +889,331 @@ public final class GameJarPatcher {
                         super.visitJumpInsn(Opcodes.IF_ICMPGE, body);
                         super.visitInsn(Opcodes.RETURN);
                         super.visitLabel(body);
+                    }
+
+                    @Override
+                    public void visitMethodInsn(final int opcode, final String owner, final String methodName,
+                                                final String methodDescriptor, final boolean itf) {
+                        if (opcode == Opcodes.INVOKESTATIC
+                                && "org/lwjgl/opengles/GLES20".equals(owner)
+                                && "glDrawArrays".equals(methodName)
+                                && "(III)V".equals(methodDescriptor)) {
+                            // stack: [mode, first, count] -> push this.mode so
+                            // the helper sees (count, mode) and returns the
+                            // clamped count, leaving [mode, first, clamped].
+                            super.visitVarInsn(Opcodes.ALOAD, 0);
+                            super.visitFieldInsn(Opcodes.GETFIELD, GLESMESH_OWNER, FIELD_MODE, "I");
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, GLESMESH_OWNER,
+                                    CLAMP_COUNT, "(II)I", false);
+                        }
+                        super.visitMethodInsn(opcode, owner, methodName, methodDescriptor, itf);
+                    }
+                };
+            }
+
+            @Override
+            public void visitEnd() {
+                emitClampCount(writer);
+                super.visitEnd();
+            }
+        };
+
+        reader.accept(visitor, 0);
+        return writer.toByteArray();
+    }
+
+    /**
+     * Emit {@code static int clampCount(int count, int mode)} into
+     * {@code GlesMesh}. Rounds a triangle draw count down to a whole number
+     * of primitives:
+     * <ul>
+     *   <li>{@code GL_TRIANGLES} -- multiple of 3;</li>
+     *   <li>{@code GL_TRIANGLES_ADJACENCY} -- multiple of 6;</li>
+     *   <li>{@code GL_TRIANGLE_STRIP} -- at least 3 vertices, otherwise 0.</li>
+     * </ul>
+     * Any other primitive type is passed through unchanged.
+     */
+    private static void emitClampCount(final ClassWriter writer) {
+        final MethodVisitor mv = writer.visitMethod(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC,
+                CLAMP_COUNT, "(II)I", null, null);
+        mv.visitCode();
+
+        // count - count % 3  (GL_TRIANGLES)
+        mv.visitVarInsn(Opcodes.ILOAD, 1);
+        mv.visitIntInsn(Opcodes.BIPUSH, GL_TRIANGLES);
+        final Label notTriangles = new Label();
+        mv.visitJumpInsn(Opcodes.IF_ICMPNE, notTriangles);
+        mv.visitVarInsn(Opcodes.ILOAD, 0);
+        mv.visitInsn(Opcodes.DUP);
+        mv.visitIntInsn(Opcodes.BIPUSH, GL_TRIANGLES_VERTS);
+        mv.visitInsn(Opcodes.IREM);
+        mv.visitInsn(Opcodes.ISUB);
+        mv.visitInsn(Opcodes.IRETURN);
+
+        // count - count % 6  (GL_TRIANGLES_ADJACENCY)
+        mv.visitLabel(notTriangles);
+        mv.visitVarInsn(Opcodes.ILOAD, 1);
+        mv.visitIntInsn(Opcodes.BIPUSH, GL_TRIANGLES_ADJACENCY);
+        final Label notAdjacency = new Label();
+        mv.visitJumpInsn(Opcodes.IF_ICMPNE, notAdjacency);
+        mv.visitVarInsn(Opcodes.ILOAD, 0);
+        mv.visitInsn(Opcodes.DUP);
+        mv.visitIntInsn(Opcodes.BIPUSH, GL_TRIANGLES_ADJACENCY_VERTS);
+        mv.visitInsn(Opcodes.IREM);
+        mv.visitInsn(Opcodes.ISUB);
+        mv.visitInsn(Opcodes.IRETURN);
+
+        // count < 3 ? 0 : count  (GL_TRIANGLE_STRIP)
+        mv.visitLabel(notAdjacency);
+        mv.visitVarInsn(Opcodes.ILOAD, 1);
+        mv.visitIntInsn(Opcodes.BIPUSH, GL_TRIANGLE_STRIP);
+        final Label notStrip = new Label();
+        mv.visitJumpInsn(Opcodes.IF_ICMPNE, notStrip);
+        mv.visitVarInsn(Opcodes.ILOAD, 0);
+        mv.visitIntInsn(Opcodes.BIPUSH, GL_TRIANGLE_STRIP_MIN);
+        final Label stripOk = new Label();
+        mv.visitJumpInsn(Opcodes.IF_ICMPGE, stripOk);
+        mv.visitInsn(Opcodes.ICONST_0);
+        mv.visitInsn(Opcodes.IRETURN);
+        mv.visitLabel(stripOk);
+        mv.visitVarInsn(Opcodes.ILOAD, 0);
+        mv.visitInsn(Opcodes.IRETURN);
+
+        // any other primitive type: unchanged
+        mv.visitLabel(notStrip);
+        mv.visitVarInsn(Opcodes.ILOAD, 0);
+        mv.visitInsn(Opcodes.IRETURN);
+
+        mv.visitMaxs(2, 2);
+        mv.visitEnd();
+    }
+
+    /**
+     * AudioThread: stop the "Device does not support OpenAL10" path from
+     * putting the audio thread into a permanent retry loop.
+     *
+     * <p>What happens on this device: the bundled {@code libopenal.so} is a
+     * stock OpenAL Soft build, while LWJGL expects its own fork of OpenAL
+     * Soft, which additionally exports the {@code al*Direct} entry points.
+     * LWJGL resolves <b>every</b> AL entry point through {@code alGetProcAddress}
+     * and its {@code ALCapabilities.check_AL10()} insists on all 109 of them,
+     * so the missing {@code alGetProcAddressDirect} alone flips
+     * {@code alCapabilities.OpenAL10} to false. The launcher's own
+     * {@code SCAudioProbe} shows it exactly:
+     * {@code alGetProcAddress sweep: 108/109 resolved, missing=alGetProcAddressDirect}.
+     *
+     * <p>The game then treats that flag as "this device cannot do OpenAL 1.0":
+     * it logs a warning, tears the device and context down and sets
+     * {@code paused = true}. The device-poll scheduler wakes every two
+     * seconds, sees {@code paused}, and re-runs the whole initialisation --
+     * forever. The result on device is a fresh OpenAL context every two
+     * seconds, the music sequence restarted on every cycle, and ~25% of the
+     * entire session log being audio-retry spam (which is also what pushed
+     * 9.5 MB of the launcher log out of the session reports).
+     *
+     * <p>The game only ever calls the plain AL 1.0 entry points
+     * ({@code alBufferData}, {@code alGenSources}, {@code alSourcePlay}, ...)
+     * and never a {@code *Direct} variant, and all of those resolve fine, so
+     * the flag is a false negative. The patch therefore redirects the
+     * "OpenAL10 is false" branch to the success path -- {@code paused = false},
+     * {@code notify()}, return -- and logs one line explaining why, so the
+     * device report still shows that the fallback was taken.
+     */
+    private static byte[] transformAudioThread(final byte[] input) {
+        final ClassReader reader = new ClassReader(input);
+        final ClassWriter writer = new ClassWriter(reader,
+                ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+            @Override
+            protected String getCommonSuperClass(final String type1, final String type2) {
+                return "java/lang/Object";
+            }
+        };
+
+        final ClassVisitor visitor = new ClassVisitor(Opcodes.ASM9, writer) {
+            @Override
+            public MethodVisitor visitMethod(final int access, final String name, final String descriptor,
+                                             final String signature, final String[] exceptions) {
+                final MethodVisitor mv = super.visitMethod(access, name, descriptor, signature, exceptions);
+                if (!"initInternal".equals(name) || !"()V".equals(descriptor)) {
+                    return mv;
+                }
+
+                return new MethodVisitor(Opcodes.ASM9, mv) {
+                    private boolean sawOpenAL10;
+
+                    @Override
+                    public void visitFieldInsn(final int opcode, final String owner, final String field,
+                                               final String fieldDesc) {
+                        super.visitFieldInsn(opcode, owner, field, fieldDesc);
+                        if (opcode == Opcodes.GETFIELD
+                                && ALCAPS_OWNER.equals(owner)
+                                && ALCAPS_OPENAL10.equals(field)
+                                && "Z".equals(fieldDesc)) {
+                            sawOpenAL10 = true;
+                        }
+                    }
+
+                    @Override
+                    public void visitJumpInsn(final int opcode, final Label label) {
+                        if (!sawOpenAL10 || opcode != Opcodes.IFEQ) {
+                            super.visitJumpInsn(opcode, label);
+                            return;
+                        }
+                        sawOpenAL10 = false;
+
+                        // Original:  IFEQ <teardown-and-pause>
+                        // Patched:    IFEQ <logAndContinue>
+                        //             GOTO  <success>
+                        //   logAndContinue:
+                        //             LOGGER.warn("...")
+                        //   success:                       <- the game's own
+                        //             paused = false;           success path
+                        //             notify();
+                        //             return;
+                        final Label logAndContinue = new Label();
+                        final Label success = new Label();
+
+                        super.visitJumpInsn(Opcodes.IFEQ, logAndContinue);
+                        super.visitJumpInsn(Opcodes.GOTO, success);
+
+                        super.visitLabel(logAndContinue);
+                        super.visitFieldInsn(Opcodes.GETSTATIC, AUDIOTHREAD_OWNER,
+                                LOGGER_FIELD, LOGGER_DESC);
+                        super.visitLdcInsn("OpenAL10 capability flag not set by the OpenAL backend "
+                                + "(alGetProcAddressDirect is missing), continuing with the AL entry "
+                                + "points that are available instead of retrying forever.");
+                        super.visitMethodInsn(Opcodes.INVOKEINTERFACE, "org/apache/logging/log4j/Logger",
+                                "warn", "(Ljava/lang/String;)V", true);
+
+                        super.visitLabel(success);
+                    }
+                };
+            }
+        };
+
+        reader.accept(visitor, 0);
+        return writer.toByteArray();
+    }
+
+    /**
+     * GlesApi: repair the KHR_debug message filter and mute the Adreno
+     * driver's "Namespace collision detected, using slow path" hint.
+     *
+     * <p>Two problems in one place:
+     *
+     * <ol>
+     *   <li>The game passes {@code GLES20.GL_DONT_CARE} (0x1100, the GLES2
+     *   <i>hint</i> constant) as the source and type filter of
+     *   {@code glDebugMessageControl}. KHR_debug's "don't care" is 0xFFFF.
+     *   0x1100 is neither a valid source/type/severity nor "don't care", so
+     *   the driver answers {@code INVALID_ENUM} and changes nothing: all four
+     *   of the game's filter calls were no-ops and the driver kept its
+     *   default state ("everything except NOTIFICATION"). This patch uses
+     *   0xFFFF, so the game gets the HIGH-only filter it asked for.
+     *
+     *   <li>Adreno's "Namespace collision detected, using slow path"
+     *   ({@code [Other/Performance] ID 2147483647}) is a known benign
+     *   driver performance hint -- it is not an error and does not affect
+     *   correctness, but it fires in bursts during heavy mesh allocation and
+     *   floods the log (65 + 52 occurrences in two device sessions) and pops
+     *   an on-screen notification. It is muted with one extra
+     *   {@code glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_PERFORMANCE,
+     *   GL_DONT_CARE, ..., false)} call.
+     * </ol>
+     */
+    private static byte[] transformGlesApiDebug(final byte[] input) {
+        // Pass 1: which methods contain the debug-control calls? The source
+        // and type filters are pushed as constants *before* the call, so the
+        // streaming API cannot tell them apart from the severity filter at
+        // push time -- but in the shipped jar every `sipush 4352` in those
+        // methods is a source or type filter (the severities are all > 32767
+        // and are pushed with ldc), so scoping the rewrite to the methods
+        // that own the calls is enough.
+        final java.util.Set<String> debugMethods = new java.util.HashSet<>();
+        new ClassReader(input).accept(new ClassVisitor(Opcodes.ASM9) {
+            @Override
+            public MethodVisitor visitMethod(final int access, final String name, final String descriptor,
+                                             final String signature, final String[] exceptions) {
+                return new MethodVisitor(Opcodes.ASM9) {
+                    @Override
+                    public void visitMethodInsn(final int opcode, final String owner, final String methodName,
+                                                final String methodDescriptor, final boolean itf) {
+                        if (opcode == Opcodes.INVOKESTATIC && GLES32_OWNER.equals(owner)) {
+                            if ("glDebugMessageControl".equals(methodName)
+                                    || "glDebugMessageCallback".equals(methodName)) {
+                                debugMethods.add(name + descriptor);
+                            }
+                        }
+                    }
+                };
+            }
+        }, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+
+        final ClassReader reader = new ClassReader(input);
+        final ClassWriter writer = new ClassWriter(reader,
+                ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+            @Override
+            protected String getCommonSuperClass(final String type1, final String type2) {
+                return "java/lang/Object";
+            }
+        };
+
+        final ClassVisitor visitor = new ClassVisitor(Opcodes.ASM9, writer) {
+            @Override
+            public MethodVisitor visitMethod(final int access, final String name, final String descriptor,
+                                             final String signature, final String[] exceptions) {
+                final MethodVisitor mv = super.visitMethod(access, name, descriptor, signature, exceptions);
+                if (!debugMethods.contains(name + descriptor)) {
+                    return mv;
+                }
+
+                return new MethodVisitor(Opcodes.ASM9, mv) {
+                    private boolean performanceMuted;
+
+                    @Override
+                    public void visitIntInsn(final int opcode, final int operand) {
+                        if (opcode == Opcodes.SIPUSH && operand == GLES2_DONT_CARE_HINT) {
+                            // GLES20.GL_DONT_CARE (0x1100) -> KHR_debug's
+                            // GL_DONT_CARE (0xFFFF). 0x1100 is invalid for
+                            // glDebugMessageControl, so the driver's reply was
+                            // INVALID_ENUM and the filter never took effect.
+                            super.visitLdcInsn(Integer.valueOf(GLES_DONT_CARE_KHR));
+                            return;
+                        }
+                        super.visitIntInsn(opcode, operand);
+                    }
+
+                    @Override
+                    public void visitMethodInsn(final int opcode, final String owner, final String methodName,
+                                                final String methodDescriptor, final boolean itf) {
+                        if (opcode == Opcodes.INVOKESTATIC
+                                && GLES32_OWNER.equals(owner)
+                                && "glDebugMessageControl".equals(methodName)
+                                && "(III[IZ)V".equals(methodDescriptor)) {
+                            super.visitMethodInsn(opcode, owner, methodName, methodDescriptor, itf);
+                            if (!performanceMuted) {
+                                // The operand stack is empty again here, so
+                                // the extra filter can be pushed safely.
+                                // Mute the driver's PERFORMANCE messages
+                                // ("Namespace collision detected, using slow
+                                // path"). The severity filters the game sets
+                                // afterwards do not touch the type filter, so
+                                // doing it once is enough.
+                                performanceMuted = true;
+                                super.visitLdcInsn(Integer.valueOf(GLES_DONT_CARE_KHR));
+                                super.visitLdcInsn(Integer.valueOf(GL_DEBUG_TYPE_PERFORMANCE));
+                                super.visitLdcInsn(Integer.valueOf(GLES_DONT_CARE_KHR));
+                                super.visitInsn(Opcodes.ICONST_0);
+                                super.visitIntInsn(Opcodes.NEWARRAY, T_INT);
+                                super.visitInsn(Opcodes.ICONST_0);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, GLES32_OWNER,
+                                        "glDebugMessageControl", "(III[IZ)V", false);
+                            }
+                            return;
+                        }
+
+                        super.visitMethodInsn(opcode, owner, methodName, methodDescriptor, itf);
                     }
                 };
             }
