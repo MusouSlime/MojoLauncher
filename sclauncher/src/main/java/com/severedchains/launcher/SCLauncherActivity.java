@@ -159,6 +159,22 @@ public class SCLauncherActivity extends AppCompatActivity {
      *  (TouchGamepadView). Default ON; the in-game mobile-controls mod is
      *  always removed since the launcher pad is the controller now. */
     public static final String PREF_TOUCH_PAD = "launcher_touch_pad";
+    /**
+     * Mute the in-game GL error popups.
+     *
+     * <p>The game's KHR_debug callback raises a five-second on-screen toast for
+     * every high-severity driver message. On the Adreno driver those are
+     * routine ("Namespace collision detected, using slow path", "All
+     * allocations busy", a degenerate triangle) and the toast is drawn over
+     * the play area, so during a battle it covers the fight.
+     *
+     * <p>Default ON: the messages are still written to the log in full (with
+     * the GL context and a stack trace), so nothing is lost for diagnosis --
+     * only the screen-covering popup is suppressed.
+     */
+    public static final String PREF_MUTE_GL_POPUPS = "mute_gl_popups";
+    /** JVM property the launcher passes to the game for the setting above. */
+    public static final String PROP_MUTE_GL_POPUPS = "sc.mute.gl.popups";
 
     /** Diagnostic probe: visualise the raw battle vertex position (inPos) as
      *  colour, untextured. See applyGpuShaderVariant + gpu_variants/probe/. */
@@ -1089,6 +1105,9 @@ public class SCLauncherActivity extends AppCompatActivity {
         menu.getMenu().add(0, 41, order++, loadTouchPad() ? "Dragoon Pad ✓" : "Dragoon Pad");
         menu.getMenu().add(0, 42, order++, "Touch Pad Opacity…");
         menu.getMenu().add(0, 43, order++, "Reset Controls");
+        menu.getMenu().add(0, 44, order++, loadMuteGlPopups()
+                ? "Mute In-Game Error Popups ✓"
+                : "Mute In-Game Error Popups");
         menu.setOnMenuItemClickListener(item -> {
             int id = item.getItemId();
             if (id == 1) {
@@ -1146,6 +1165,9 @@ public class SCLauncherActivity extends AppCompatActivity {
             } else if (id == 43) {
                 resetControls();
                 return true;
+            } else if (id == 44) {
+                setMuteGlPopups(!loadMuteGlPopups());
+                return true;
             }
             return false;
         });
@@ -1201,6 +1223,38 @@ public class SCLauncherActivity extends AppCompatActivity {
         String label = enabled
                 ? "Dragoon Pad ON (Legend of Dragoon themed controls)"
                 : "Dragoon Pad OFF (touch-as-mouse for menus)";
+        try {
+            android.widget.Toast.makeText(this, label, android.widget.Toast.LENGTH_SHORT).show();
+        } catch (Exception ignored) {}
+        LogFile.log(label);
+        SCActionTrail.record(label);
+    }
+
+    /**
+     * Persisted "mute in-game error popups" setting.
+     *
+     * <p>Passed to the game as the system property
+     * {@link #PROP_MUTE_GL_POPUPS}; the patched
+     * {@code GlesApi.notifyGl} helper reads it and skips the on-screen toast.
+     * The GL messages themselves are still logged in full.
+     */
+    private boolean loadMuteGlPopups() {
+        try {
+            return getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getBoolean(PREF_MUTE_GL_POPUPS, true);
+        } catch (Exception ignored) {
+            return true;
+        }
+    }
+
+    private void setMuteGlPopups(final boolean muted) {
+        try {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit().putBoolean(PREF_MUTE_GL_POPUPS, muted).apply();
+        } catch (Exception ignored) {}
+        final String label = muted
+                ? "In-game error popups MUTED (the messages are still in the log)"
+                : "In-game error popups SHOWN";
         try {
             android.widget.Toast.makeText(this, label, android.widget.Toast.LENGTH_SHORT).show();
         } catch (Exception ignored) {}
@@ -2725,6 +2779,12 @@ public class SCLauncherActivity extends AppCompatActivity {
         args.add("-Djoml.fastmath");
         args.add("-Djoml.sinLookup");
         args.add("-Djoml.useMathFma");
+
+        // Mute the in-game GL error popups (the driver messages are still
+        // logged in full). Read by the patched GlesApi.notifyGl helper.
+        if (loadMuteGlPopups()) {
+            args.add("-D" + PROP_MUTE_GL_POPUPS + "=true");
+        }
 
         // JRE libs must be on java.library.path or System.loadLibrary("jsound")
         // (Spu audio) fails: default path is replaced by the override below.

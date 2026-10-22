@@ -103,7 +103,7 @@ public final class GameJarPatcher {
      * "Extended" mode (Forced 4:3 was unaffected because that path never reads
      * {@code expectedWidth}).
      */
-    public static final String MARKER = ".gamejar_patch_v22";
+    public static final String MARKER = ".gamejar_patch_v23";
 
     /**
      * Patch-revision stamp stored in the marker. <b>Change this whenever the
@@ -111,7 +111,7 @@ public final class GameJarPatcher {
      * {@link #fingerprint()} so it cannot be forgotten again). It is logged on
      * every launch, which makes a stale patch visible in a device report.
      */
-    public static final String PATCH_REVISION = "r23";
+    public static final String PATCH_REVISION = "r24";
 
     /** Rewritten {@code expectedWidth} for the retail widescreen branch. */
     private static final int EXPECTED_WIDTH_FROM = 368;
@@ -330,8 +330,19 @@ public final class GameJarPatcher {
     private static final String ALCAPS_OWNER = "org/lwjgl/openal/ALCapabilities";
     private static final String ALCAPS_OPENAL10 = "OpenAL10";
 
-    private static final String GLESAPI_DEBUG_ENTRY = "legend/core/renderer/opengles/GlesApi.class";
     private static final String GLES32_OWNER = "org/lwjgl/opengles/GLES32";
+    private static final String GLESAPI_OWNER = "legend/core/renderer/opengles/GlesApi";
+    private static final String GAMEOVERLAY_OWNER = "legend/game/ui/GameOverlay";
+    private static final String NOTIFY_DESC = "(ILlegend/core/lang/TextComponent;)V";
+    private static final String GET_OBJECT_NAME = "getObjectName";
+    private static final String GET_OBJECT_NAME_DESC = "(II)Ljava/lang/String;";
+    /** Name of the injected helper that replaces the on-screen GL error popup. */
+    private static final String NOTIFY_GL = "notifyGl";
+    /**
+     * System property the launcher sets when the player wants the in-game GL
+     * error popups muted. Read by the patched {@link #NOTIFY_GL} helper.
+     */
+    private static final String MUTE_POPUPS_PROPERTY = "sc.mute.gl.popups";
     /**
      * KHR_debug's "don't care" filter is 0xFFFF. The game passes
      * {@code GLES20.GL_DONT_CARE}, which is the <b>GLES2 hint</b> constant
@@ -434,6 +445,52 @@ public final class GameJarPatcher {
     }
 
     /**
+     * Every jar entry that {@link #transformJar} rewrites, with the transform
+     * that owns it.
+     *
+     * <p>{@link #transformJar} dispatches on the entry name with an
+     * {@code if / else if} chain, so <b>two entries with the same name means
+     * one of the transforms is silently dropped</b> — no error, no log line,
+     * just a patch that stopped being applied. That is not hypothetical: in
+     * r23 a second branch for {@code GlesApi.class} (the KHR_debug filter)
+     * shadowed the branch that rewrote the widescreen gates, and the battle
+     * HUD portraits went back to being wrong with nothing in the log to say
+     * why.
+     *
+     * <p>This table is the single source of truth for the dispatch, and the
+     * check below fails loudly if two owners ever claim the same file again.
+     */
+    private static final String[][] PATCH_TARGETS = {
+            { GLESMESH_ENTRY, "glesmesh" },
+            { AUDIOTHREAD_ENTRY, "audiothread" },
+            { GLESAPI_ENTRY, "glesapi" },
+            { UNPACKER_ENTRY, "unpacker" },
+            { CONFIG_ENTRY, "config" },
+            { ISOREADER_ENTRY, "isoreader" },
+            { RENDERENGINE_ENTRY, "renderengine" },
+            { GENERICSPRITE_ENTRY, "genericsprite" },
+            { GLESTEXTURE_ENTRY, "glestexture" },
+            { SHADEROPTS_TMD_ENTRY, "shaderopts-tmd" },
+            { SHADEROPTS_BTMD_ENTRY, "shaderopts-btmd" },
+            { RENDERBATCH_ENTRY, "renderbatch" },
+            { SCISSORSTACK_ENTRY, "scissorstack" },
+            { TRANSFORMATIONS_ENTRY, "transformations" },
+            { TEXT_ENTRY, "text" },
+            { UPDATER_ENTRY, "updater" },
+    };
+
+    static {
+        final java.util.Set<String> seen = new java.util.HashSet<>();
+        for (final String[] target : PATCH_TARGETS) {
+            if (!seen.add(target[0])) {
+                throw new IllegalStateException("GameJarPatcher: two patch targets claim the same jar entry: "
+                        + target[0] + " (" + target[1] + ") -- merge them into one branch, or the second "
+                        + "transform is silently dropped by the else-if chain");
+            }
+        }
+    }
+
+    /**
      * TEMPORARY diagnostic helpers (see {@link #ENABLE_WIDESCREEN_DIAG}).
      *
      * <p>Each emits a straight-line {@code System.err} print with no branch
@@ -521,6 +578,10 @@ public final class GameJarPatcher {
                 GL_TRIANGLES_ADJACENCY_VERTS, GL_TRIANGLE_STRIP_MIN,
                 GLES_DONT_CARE_KHR, GLES2_DONT_CARE_HINT,
                 GL_DEBUG_TYPE_PERFORMANCE,
+                // The GL-popup mute is a patch *shape* change (a new synthetic
+                // method plus a redirect), not just a constant tweak, so it
+                // belongs in the stamp as well as in PATCH_REVISION.
+                NOTIFY_GL, NOTIFY_DESC, GAMEOVERLAY_OWNER, MUTE_POPUPS_PROPERTY,
         });
         return Integer.toHexString(h);
     }
@@ -751,9 +812,23 @@ public final class GameJarPatcher {
                 } else if (AUDIOTHREAD_ENTRY.equals(entry.getName())) {
                     patched |= PATCHED_AUDIOTHREAD;
                     zos.write(transformAudioThread(readAll(zis)));
-                } else if (GLESAPI_DEBUG_ENTRY.equals(entry.getName())) {
+                } else if (GLESAPI_ENTRY.equals(entry.getName())) {
+                    // GlesApi needs BOTH transforms, so they cannot be
+                    // separate branches of the else-if chain: two entries
+                    // with the same name means one of the transforms is
+                    // silently dropped. That is exactly what happened in r23
+                    // -- the KHR_debug-filter branch shadowed the branch
+                    // that rewrote the widescreen gates, and the battle HUD
+                    // portraits went back to being wrong with nothing in the
+                    // log to say why. See PATCH_TARGETS for the guard.
+                    byte[] glesApi = readAll(zis);
+                    if (ENABLE_DECOUPLE_WIDESCREEN) {
+                        patched |= PATCHED_GLESAPI;
+                        glesApi = transformWidescreenGates(glesApi, false);
+                    }
                     patched |= PATCHED_GLESAPI_DEBUG;
-                    zos.write(transformGlesApiDebug(readAll(zis)));
+                    glesApi = transformGlesApiDebug(glesApi);
+                    zos.write(glesApi);
                 } else if (boundUnpacker && UNPACKER_ENTRY.equals(entry.getName())) {
                     patched |= PATCHED_UNPACKER;
                     zos.write(transformUnpacker(readAll(zis)));
@@ -782,9 +857,6 @@ public final class GameJarPatcher {
                         && RENDERBATCH_ENTRY.equals(entry.getName())) {
                     patched |= PATCHED_RENDERBATCH;
                     zos.write(transformRenderBatch(readAll(zis)));
-                } else if (ENABLE_DECOUPLE_WIDESCREEN && GLESAPI_ENTRY.equals(entry.getName())) {
-                    patched |= PATCHED_GLESAPI;
-                    zos.write(transformWidescreenGates(readAll(zis), false));
                 } else if (ENABLE_DECOUPLE_WIDESCREEN && SCISSORSTACK_ENTRY.equals(entry.getName())) {
                     patched |= PATCHED_SCISSORSTACK;
                     zos.write(transformWidescreenGates(readAll(zis), true));
@@ -1123,14 +1195,23 @@ public final class GameJarPatcher {
      * </ol>
      */
     private static byte[] transformGlesApiDebug(final byte[] input) {
-        // Pass 1: which methods contain the debug-control calls? The source
-        // and type filters are pushed as constants *before* the call, so the
-        // streaming API cannot tell them apart from the severity filter at
-        // push time -- but in the shipped jar every `sipush 4352` in those
-        // methods is a source or type filter (the severities are all > 32767
-        // and are pushed with ldc), so scoping the rewrite to the methods
-        // that own the calls is enough.
+        // Pass 1: which methods contain the debug-control calls, and which one
+        // is the debug callback itself?
+        //
+        // The source and type filters are pushed as constants *before* the
+        // glDebugMessageControl call, so the streaming API cannot tell them
+        // apart from the severity filter at push time -- but in the shipped
+        // jar every `sipush 4352` in those methods is a source or type filter
+        // (the severities are all > 32767 and are pushed with ldc), so
+        // scoping the rewrite to the methods that own the calls is enough.
+        //
+        // The debug callback is the KHR_debug lambda, which compiles to a
+        // synthetic method. It is the only caller of the private
+        // GlesApi.getObjectName(II) helper (it resolves the shader/texture/
+        // VAO/VBO names for the error dump), so that call is what identifies
+        // it -- far more robust than guessing the lambda index.
         final java.util.Set<String> debugMethods = new java.util.HashSet<>();
+        final java.util.Set<String> callbackMethods = new java.util.HashSet<>();
         new ClassReader(input).accept(new ClassVisitor(Opcodes.ASM9) {
             @Override
             public MethodVisitor visitMethod(final int access, final String name, final String descriptor,
@@ -1144,6 +1225,12 @@ public final class GameJarPatcher {
                                     || "glDebugMessageCallback".equals(methodName)) {
                                 debugMethods.add(name + descriptor);
                             }
+                        }
+                        if ((opcode == Opcodes.INVOKEVIRTUAL || opcode == Opcodes.INVOKESPECIAL)
+                                && GLESAPI_OWNER.equals(owner)
+                                && GET_OBJECT_NAME.equals(methodName)
+                                && GET_OBJECT_NAME_DESC.equals(methodDescriptor)) {
+                            callbackMethods.add(name + descriptor);
                         }
                     }
                 };
@@ -1164,7 +1251,9 @@ public final class GameJarPatcher {
             public MethodVisitor visitMethod(final int access, final String name, final String descriptor,
                                              final String signature, final String[] exceptions) {
                 final MethodVisitor mv = super.visitMethod(access, name, descriptor, signature, exceptions);
-                if (!debugMethods.contains(name + descriptor)) {
+                final boolean isDebugSetup = debugMethods.contains(name + descriptor);
+                final boolean isCallback = callbackMethods.contains(name + descriptor);
+                if (!isDebugSetup && !isCallback) {
                     return mv;
                 }
 
@@ -1213,14 +1302,75 @@ public final class GameJarPatcher {
                             return;
                         }
 
+                        if (isCallback
+                                && opcode == Opcodes.INVOKESTATIC
+                                && GAMEOVERLAY_OWNER.equals(owner)
+                                && "addNotification".equals(methodName)
+                                && NOTIFY_DESC.equals(methodDescriptor)) {
+                            // Route the on-screen GL error popup through
+                            // notifyGl(), which honours the launcher's
+                            // "mute in-game error popups" setting. The
+                            // errors are still logged in full; only the
+                            // screen-covering popup is suppressed.
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, GLESAPI_OWNER,
+                                    NOTIFY_GL, NOTIFY_DESC, false);
+                            return;
+                        }
+
                         super.visitMethodInsn(opcode, owner, methodName, methodDescriptor, itf);
                     }
                 };
+            }
+
+            @Override
+            public void visitEnd() {
+                emitNotifyGl(writer);
+                super.visitEnd();
             }
         };
 
         reader.accept(visitor, 0);
         return writer.toByteArray();
+    }
+
+    /**
+     * Emit {@code private static void notifyGl(int, TextComponent)} into
+     * {@code GlesApi}.
+     *
+     * <p>The game's KHR_debug callback raises a five-second on-screen toast for
+     * every high-severity driver message. On the Adreno driver those are
+     * routine ("Namespace collision detected, using slow path", "All
+     * allocations busy. Blocking on oldest busy.", a degenerate triangle), and
+     * the toast is drawn over the whole play area -- during a battle it
+     * covers the fight.
+     *
+     * <p>This helper replaces that call. The message is still written to the
+     * log (with the full GL context and a stack trace), so nothing is lost
+     * for diagnosis; only the on-screen popup is suppressed, and only when the
+     * player asked for it.
+     */
+    private static void emitNotifyGl(final ClassWriter writer) {
+        final MethodVisitor mv = writer.visitMethod(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC,
+                NOTIFY_GL, NOTIFY_DESC, null, null);
+        mv.visitCode();
+
+        mv.visitLdcInsn(MUTE_POPUPS_PROPERTY);
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Boolean",
+                "getBoolean", "(Ljava/lang/String;)Z", false);
+        final Label muted = new Label();
+        mv.visitJumpInsn(Opcodes.IFNE, muted);
+
+        mv.visitVarInsn(Opcodes.ILOAD, 0);
+        mv.visitVarInsn(Opcodes.ALOAD, 1);
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, GAMEOVERLAY_OWNER,
+                "addNotification", NOTIFY_DESC, false);
+
+        mv.visitLabel(muted);
+        mv.visitInsn(Opcodes.RETURN);
+
+        mv.visitMaxs(2, 2);
+        mv.visitEnd();
     }
 
     /**
