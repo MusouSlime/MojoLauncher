@@ -293,7 +293,7 @@ public final class GameJarPatcher {
      * 3D matrix but not the viewport/scissor, which is the "stuck in stretched"
      * / mismatched-framing bug.
      */
-    private static final boolean ENABLE_DECOUPLE_WIDESCREEN = !IS_X86_64;
+    private static final boolean ENABLE_DECOUPLE_WIDESCREEN = true;
 
     /**
      * FIX: make the modern (PERSPECTIVE) screen-space conversion return
