@@ -215,6 +215,16 @@ public final class GameJarPatcher {
     private static final boolean ENABLE_FORCE_PS1DEPTH = true;
 
     /**
+     * The Adreno battle workarounds below force the game's legacy 368-wide
+     * projection. Mesa/Waydroid does not need them, and they override the
+     * user's EXPANDED widescreen mode (nativeW=368 + black bar on a 16:9
+     * display), so they are disabled for the x86_64 Waydroid test build.
+     */
+    private static final boolean IS_X86_64 =
+            "x86_64".equals(System.getProperty("os.arch"))
+            || "amd64".equals(System.getProperty("os.arch"));
+
+    /**
      * Force {@code RenderBatch.setRenderMode(...)} to always use
      * {@code RenderMode.LEGACY}. Superseded by
      * {@link #ENABLE_DECOUPLE_BATTLE}; kept disabled.
@@ -259,7 +269,7 @@ public final class GameJarPatcher {
      *       forced true, so FORCED_4_3/STRETCHED/EXPANDED all take effect.</li>
      * </ol>
      */
-    private static final boolean ENABLE_DECOUPLE_BATTLE = true;
+    private static final boolean ENABLE_DECOUPLE_BATTLE = !IS_X86_64;
 
     /**
      * Companion to {@link #ENABLE_DECOUPLE_BATTLE}: the game's widescreen
@@ -283,7 +293,7 @@ public final class GameJarPatcher {
      * 3D matrix but not the viewport/scissor, which is the "stuck in stretched"
      * / mismatched-framing bug.
      */
-    private static final boolean ENABLE_DECOUPLE_WIDESCREEN = true;
+    private static final boolean ENABLE_DECOUPLE_WIDESCREEN = !IS_X86_64;
 
     /**
      * FIX: make the modern (PERSPECTIVE) screen-space conversion return
