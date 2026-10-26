@@ -182,6 +182,16 @@ public final class GameJarPatcher {
     private static final boolean ENABLE_EFFECT_OPAQUE_PATCH = false;
 
     /**
+     * The Adreno battle workarounds below force the game's legacy 368-wide
+     * projection. Mesa/Waydroid does not need them, and they override the
+     * user's EXPANDED widescreen mode (nativeW=368 + black bar on a 16:9
+     * display), so they are disabled for the x86_64 Waydroid test build.
+     */
+    private static final boolean IS_X86_64 =
+            "x86_64".equals(System.getProperty("os.arch"))
+            || "amd64".equals(System.getProperty("os.arch"));
+
+    /**
      * Depth-buffer texture format: change the game's {@code TextureDataType.UINT}
      * depth texture back to {@code FLOAT} to match the desktop build.
      *
@@ -202,7 +212,7 @@ public final class GameJarPatcher {
      * internal format for {@code DEPTH_COMPONENT} → {@code GL_DEPTH_COMPONENT32F}
      * ({@link #transformGlesTextureDepth}, guarded by the same flag).
      */
-    private static final boolean ENABLE_DEPTH_FLOAT_PATCH = true;
+    private static final boolean ENABLE_DEPTH_FLOAT_PATCH = !IS_X86_64;
 
     /**
      * Force {@code usePs1Depth} true for every TMD / battle-TMD model, so all
@@ -212,17 +222,7 @@ public final class GameJarPatcher {
      * only remaining launcher-side lever for the battle "out of order" /
      * see-through model issue.
      */
-    private static final boolean ENABLE_FORCE_PS1DEPTH = true;
-
-    /**
-     * The Adreno battle workarounds below force the game's legacy 368-wide
-     * projection. Mesa/Waydroid does not need them, and they override the
-     * user's EXPANDED widescreen mode (nativeW=368 + black bar on a 16:9
-     * display), so they are disabled for the x86_64 Waydroid test build.
-     */
-    private static final boolean IS_X86_64 =
-            "x86_64".equals(System.getProperty("os.arch"))
-            || "amd64".equals(System.getProperty("os.arch"));
+    private static final boolean ENABLE_FORCE_PS1DEPTH = !IS_X86_64;
 
     /**
      * Force {@code RenderBatch.setRenderMode(...)} to always use
@@ -293,7 +293,7 @@ public final class GameJarPatcher {
      * 3D matrix but not the viewport/scissor, which is the "stuck in stretched"
      * / mismatched-framing bug.
      */
-    private static final boolean ENABLE_DECOUPLE_WIDESCREEN = true;
+    private static final boolean ENABLE_DECOUPLE_WIDESCREEN = !IS_X86_64;
 
     /**
      * FIX: make the modern (PERSPECTIVE) screen-space conversion return
@@ -321,7 +321,7 @@ public final class GameJarPatcher {
      * <p>Only the modern branch is touched: the LEGACY branch returns early
      * and is already correct (it is what the title screen and submap use).
      */
-    private static final boolean ENABLE_SCREENSPACE_FIX = true;
+    private static final boolean ENABLE_SCREENSPACE_FIX = !IS_X86_64;
 
     private static final String GLESMESH_ENTRY = "legend/core/renderer/opengles/GlesMesh.class";
     private static final String GLESMESH_OWNER = "legend/core/renderer/opengles/GlesMesh";
