@@ -85,6 +85,15 @@ public class SCLauncherActivity extends AppCompatActivity {
     private static final String JRE_RUNTIME_NAME = "Internal-25";
     private static final int JRE_REQUIRED_VERSION = 25;
     private static final String LOCAL_JRE_ASSET = "jre/jre25-android-arm64.tar.xz";
+    /**
+     * Game bundle manifest published alongside each launcher release.
+     * "latest/download" always resolves to the newest non-prerelease release,
+     * so a game update is picked up as soon as its release is published.
+     * For local testing, put a URL in the file "game-update-url.txt" in the
+     * game directory (next to the jar); it overrides this constant.
+     */
+    private static final String GAME_UPDATE_MANIFEST_URL =
+            "https://github.com/MusouSlime/Severed-Chains-Android-Lavitz-Edition/releases/latest/download/game-update.json";
 
     private static final String FFMPEG_MAVEN_BASE = "https://repo1.maven.org/maven2/org/bytedeco/ffmpeg/8.0.1-1.5.13/";
     private static final String FFMPEG_ANDROID_FILE = "ffmpeg-8.0.1-1.5.13-android-arm64.jar";
@@ -1091,6 +1100,7 @@ public class SCLauncherActivity extends AppCompatActivity {
         }
         menu.getMenu().add(0, 5, order++, "Import JRE…");
         menu.getMenu().add(0, 6, order++, "Disc Status…");
+        menu.getMenu().add(0, 7, order++, "Update Game…");
         for (int i = 0; i < DISC_FILE_PATTERNS.length; i++) {
             menu.getMenu().add(0, 10 + i, order++, discLabel(i));
         }
@@ -1127,6 +1137,9 @@ public class SCLauncherActivity extends AppCompatActivity {
                 return true;
             } else if (id == 6) {
                 showDiscStatusDialog();
+                return true;
+            } else if (id == 7) {
+                updateGame();
                 return true;
             } else if (id >= 10 && id < 14) {
                 pickDiscImage(id - 10);
@@ -2848,6 +2861,7 @@ public class SCLauncherActivity extends AppCompatActivity {
      */
     private int computeMaxHeapMb() {
         long totalMb = 0;
+        boolean lowRam = false;
         try {
             android.app.ActivityManager am = (android.app.ActivityManager)
                     getSystemService(ACTIVITY_SERVICE);
@@ -2855,6 +2869,7 @@ public class SCLauncherActivity extends AppCompatActivity {
             if (am != null) {
                 am.getMemoryInfo(mi);
                 totalMb = mi.totalMem / (1024L * 1024L);
+                lowRam = am.isLowRamDevice();
             }
         } catch (Throwable ignored) {
         }
@@ -2864,7 +2879,24 @@ public class SCLauncherActivity extends AppCompatActivity {
         long heapMb = totalMb / 3;
         if (heapMb < 768) heapMb = 768;
         if (heapMb > 2560) heapMb = 2560;
-        LogFile.log("Max heap: " + heapMb + "m (physical RAM " + totalMb + "m)");
+        // Waydroid/cgroup memory caps do not change /proc/meminfo, so a low-RAM
+        // Android profile must cap the in-process JVM heap explicitly.
+        //
+        // The first-run unpacker materialises individual files in a byte[]
+        // (FileBackedFileData.getBytes), so it needs headroom; 768m OOMs during
+        // the write phase. Use 1024m only until files/version exists, then the
+        // watchdog restart comes back with 768m for the game/title.
+        final boolean unpacking = gameDir != null
+                && !new File(new File(gameDir, "files"), "version").isFile();
+        long cap = 2560;
+        if (lowRam || isX86_64()) {
+            cap = unpacking ? 1024 : 768;
+        }
+        if (heapMb > cap) heapMb = cap;
+        LogFile.log("Max heap: " + heapMb + "m (physical RAM " + totalMb + "m"
+                + (lowRam ? ", low-RAM device" : "")
+                + (isX86_64() ? (unpacking ? ", x86 unpack 1024m cap" : ", x86 768m cap") : "")
+                + ")");
         return (int) heapMb;
     }
 
@@ -3333,6 +3365,177 @@ public class SCLauncherActivity extends AppCompatActivity {
                 });
             }
         }).start();
+    }
+
+    // ------------------------------------------------------------------
+    // Launcher-managed game update: manifest -> checksum -> backup ->
+    // jar/patches swap -> force Android re-patch -> relaunch.
+    // User data (files/, isos/, saves/, mods/, configs) is never touched.
+    // ------------------------------------------------------------------
+    private void updateGame() {
+        if (gameDir == null) return;
+        if (SCGameActivity.isJvmStarted()) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Update Game")
+                    .setMessage("Close the game first, then update from the launcher.")
+                    .setPositiveButton("OK", null)
+                    .show();
+            return;
+        }
+
+        menuButton.setEnabled(false);
+        progressBar.setVisibility(View.VISIBLE);
+        downloadStatusText.setVisibility(View.VISIBLE);
+        downloadStatusText.setTextColor(0xFFCCCCCC);
+        updateDownloadStatus("Checking for game update...");
+
+        new Thread(() -> {
+            File cache = new File(getCacheDir(), "game-update");
+            File backup = null;
+            try {
+                deleteRecursive(cache);
+                cache.mkdirs();
+
+                File manifestFile = new File(cache, "game-update.json");
+                downloadFile(gameUpdateManifestUrl(), manifestFile);
+                final org.json.JSONObject m = new org.json.JSONObject(readUtf8(manifestFile));
+                final String version = m.getString("version");
+                final String base = m.getString("url");
+
+                File installedVersion = new File(gameDir, "game.version");
+                if (installedVersion.isFile() && version.equals(readUtf8(installedVersion))) {
+                    uiHandler.post(() -> {
+                        progressBar.setVisibility(View.GONE);
+                        downloadStatusText.setVisibility(View.GONE);
+                        menuButton.setEnabled(true);
+                        new AlertDialog.Builder(this)
+                                .setTitle("Update Game")
+                                .setMessage("Already up to date: " + version)
+                                .setPositiveButton("OK", null)
+                                .show();
+                    });
+                    return;
+                }
+
+                updateDownloadStatus("Downloading game " + version + "...");
+                File newJar = new File(cache, m.getString("jar"));
+                downloadFile(base + m.getString("jar"), newJar);
+                verifyDownload(newJar, m.getString("jarSha256"), m.optLong("jarSize", -1), "game jar");
+
+                File newPatches = new File(cache, m.getString("patches"));
+                downloadFile(base + m.getString("patches"), newPatches);
+                verifyDownload(newPatches, m.getString("patchesSha256"), m.optLong("patchesSize", -1), "patches");
+
+                updateDownloadStatus("Backing up current game...");
+                backup = new File(gameDir, "update-backup-" + System.currentTimeMillis());
+                backup.mkdirs();
+                File oldJar = new File(gameDir, MAIN_JAR_NAME);
+                copyFile(oldJar, new File(backup, MAIN_JAR_NAME));
+                File oldPatches = new File(gameDir, "patches");
+                if (oldPatches.isDirectory()) copyRecursive(oldPatches, new File(backup, "patches"));
+                File oldMarker = new File(gameDir, GameJarPatcher.MARKER);
+                if (oldMarker.isFile()) copyFile(oldMarker, new File(backup, GameJarPatcher.MARKER));
+
+                updateDownloadStatus("Installing " + version + "...");
+                copyFile(newJar, oldJar);
+                if (oldPatches.exists()) deleteRecursive(oldPatches);
+                extractZip(newPatches, gameDir);
+                if (oldMarker.exists()) oldMarker.delete();
+
+                updateDownloadStatus("Applying Android patches...");
+                GameJarPatcher.Result patch = GameJarPatcher.patch(oldJar, gameDir, true, true);
+                if (!patch.patched && !patch.message.contains("already patched")) {
+                    throw new IOException("Android patch failed: " + patch.message);
+                }
+                writeUtf8(installedVersion, version);
+
+                String unpackVersion = readUtf8(new File(gameDir, "files/version"));
+                boolean reRip = m.has("unpackVersion")
+                        && !String.valueOf(m.getInt("unpackVersion")).equals(unpackVersion);
+                LogFile.log("Game update installed: " + version + "; " + patch.message
+                        + "; reRip=" + reRip);
+                SCActionTrail.record("Game update installed: " + version);
+
+                final boolean needsRip = reRip;
+                uiHandler.post(() -> {
+                    progressBar.setVisibility(View.GONE);
+                    downloadStatusText.setVisibility(View.GONE);
+                    menuButton.setEnabled(true);
+                    refreshAll();
+                    new AlertDialog.Builder(this)
+                            .setTitle("Game updated")
+                            .setMessage("Installed " + version + ".\n"
+                                    + (needsRip ? "The game data must be re-extracted on next launch (ISOs required)." : "Launch the game to test."))
+                            .setPositiveButton("OK", null)
+                            .show();
+                });
+            } catch (final Exception e) {
+                LogFile.error("Game update failed", e);
+                try {
+                    if (backup != null) {
+                        copyFile(new File(backup, MAIN_JAR_NAME), new File(gameDir, MAIN_JAR_NAME));
+                        File bp = new File(backup, "patches");
+                        if (bp.isDirectory()) {
+                            File cur = new File(gameDir, "patches");
+                            if (cur.exists()) deleteRecursive(cur);
+                            copyRecursive(bp, cur);
+                        }
+                        File bm = new File(backup, GameJarPatcher.MARKER);
+                        if (bm.isFile()) copyFile(bm, new File(gameDir, GameJarPatcher.MARKER));
+                    }
+                } catch (Exception ignored) {
+                }
+                uiHandler.post(() -> {
+                    progressBar.setVisibility(View.GONE);
+                    downloadStatusText.setText("Update failed: " + e.getMessage());
+                    downloadStatusText.setTextColor(0xFFFF6666);
+                    menuButton.setEnabled(true);
+                });
+            } finally {
+                deleteRecursive(cache);
+            }
+        }, "SCGameUpdate").start();
+    }
+
+    /** Production manifest unless game-update-url.txt overrides it for testing. */
+    private String gameUpdateManifestUrl() {
+        final String override = readUtf8(new File(gameDir, "game-update-url.txt"));
+        return override.isEmpty() ? GAME_UPDATE_MANIFEST_URL : override;
+    }
+
+    private void verifyDownload(final File file, final String sha256, final long size, final String label) throws Exception {
+        if (size > 0 && file.length() != size) {
+            throw new IOException(label + " size mismatch: " + file.length() + " != " + size);
+        }
+        final String actual = sha256(file);
+        if (sha256 != null && !sha256.isEmpty() && !sha256.equalsIgnoreCase(actual)) {
+            throw new IOException(label + " SHA-256 mismatch");
+        }
+    }
+
+    private static String readUtf8(final File file) {
+        try {
+            if (!file.isFile()) return "";
+            return new String(java.nio.file.Files.readAllBytes(file.toPath()), java.nio.charset.StandardCharsets.UTF_8).trim();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private static void writeUtf8(final File file, final String text) throws Exception {
+        java.nio.file.Files.write(file.toPath(), (text + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    private static String sha256(final File file) throws Exception {
+        final java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+        try (java.io.InputStream in = new java.io.FileInputStream(file)) {
+            final byte[] buf = new byte[65536];
+            int n;
+            while ((n = in.read(buf)) != -1) md.update(buf, 0, n);
+        }
+        final StringBuilder sb = new StringBuilder();
+        for (final byte b : md.digest()) sb.append(String.format("%02x", b));
+        return sb.toString();
     }
 
     // ------------------------------------------------------------------

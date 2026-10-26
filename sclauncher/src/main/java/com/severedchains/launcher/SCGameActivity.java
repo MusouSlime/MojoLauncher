@@ -759,6 +759,47 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
                 // foreign .so files (tombstone: ClassNotFound Loader in nativeLoad).
                 // Native preload happens inside jvmrunner.c via dlopen instead.
 
+                // First run: the ISO rip happens inside this JVM and keeps its
+                // file tree/threads resident. On a 2 GB/low-RAM device that
+                // residue plus the title/game is what makes the end of the rip
+                // look like a crash. Once the game writes files/version, restart
+                // this process so the second launch starts with only the game.
+                final java.io.File versionFile = new java.io.File(
+                        dirData, "files/games/SCLauncher/files/version");
+                final java.io.File patchCache = new java.io.File(
+                        dirData, "files/games/SCLauncher/files/patches/cache/scripts.csv");
+                boolean lowRam = false;
+                try {
+                    android.app.ActivityManager am = (android.app.ActivityManager)getSystemService(ACTIVITY_SERVICE);
+                    lowRam = am != null && am.isLowRamDevice();
+                } catch(Throwable ignored) {
+                }
+                final boolean firstRunWatch = !versionFile.isFile()
+                        && (lowRam || "x86_64".equals(System.getProperty("os.arch")));
+                if(firstRunWatch) {
+                    new Thread(() -> {
+                        try {
+                            for(int i = 0; i < 1200; i++) {
+                                // The unpacker creates the marker empty and writes
+                                // its content last; restarting on existence alone
+                                // kills the app mid-rip (the "crash at the end").
+                                if(versionFile.isFile() && versionFile.length() > 0
+                                        && patchCache.isFile()) {
+                                    Thread.sleep(2000);
+                                    if(versionFile.length() > 0 && patchCache.isFile()) {
+                                        SCLogger.appendToLog(
+                                                "Unpack + script-patch cache complete — restarting app to release unpacker memory");
+                                        ui.post(() -> restartFresh());
+                                        return;
+                                    }
+                                }
+                                Thread.sleep(500);
+                            }
+                        } catch(InterruptedException ignored) {
+                        }
+                    }, "SCGame-UnpackWatch").start();
+                }
+
                 JVMRunner.Runtime rt = new JVMRunner.Runtime(runtimeName, System.getProperty("os.arch"), 25);
                 JVMRunner.startJvm(rt, vmArgs, cp, mainClass, appArgs == null ? new ArrayList<>() : appArgs);
 
