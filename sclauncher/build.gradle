@@ -34,7 +34,7 @@ android {
         applicationId isLite ? "com.severedchains.launcher.lite" : "com.severedchains.launcher"
         minSdkVersion 21
         targetSdkVersion 36
-        versionCode 20261059
+        versionCode isX64 ? 20261060 : 20261059
         versionName isLite ? baseVersionName + "-lite" : baseVersionName
         multiDexEnabled false
         ndk {
