@@ -53,8 +53,21 @@ import java.util.zip.ZipOutputStream;
  *   {@code GL_DONT_CARE} (0x1100) to {@code glDebugMessageControl}, where
  *   KHR_debug's 0xFFFF belongs; every one of its filter calls was therefore
  *   answered with INVALID_ENUM and changed nothing. The patch uses the right
- *   constant and additionally mutes the driver's PERFORMANCE messages (the
- *   Adreno "Namespace collision detected, using slow path" hint).</li>
+ *   constant and additionally mutes the driver's PERFORMANCE/OTHER messages
+ *   and the no-ID sentinel (the Adreno "Namespace collision detected, using
+ *   slow path" hint).</li>
+ *
+ *   <p><b>r25 ordering fix:</b> r24 inserted the PERFORMANCE mute after the
+ *   game's <i>first</i> filter call. The game then calls
+ *   {@code glDebugMessageControl(..., GL_DEBUG_SEVERITY_HIGH, true)}, and
+ *   KHR_debug's last matching rule wins, so the HIGH enable re-enabled the
+ *   very messages the mute had just disabled. The device logs still showed
+ *   ~97,000 suppressed lines from the namespace-collision message and the
+ *   r24 release did not stop the synchronous callback overhead. The mutes are
+ *   now emitted after the final filter call (immediately before
+ *   {@code glDebugMessageCallback}), and the callback itself drops messages
+ *   whose driver ID is the 0x7FFFFFFF no-ID sentinel as a belt-and-braces
+ *   guard in case a driver ignores the type/ID filter.</p>
  *
  *   <li><b>Unpacker I/O bound (LITE BUILD ONLY)</b> —
  *   {@code legend.game.unpacker.Unpacker} runs its transform and write phases
@@ -111,7 +124,7 @@ public final class GameJarPatcher {
      * {@link #fingerprint()} so it cannot be forgotten again). It is logged on
      * every launch, which makes a stale patch visible in a device report.
      */
-    public static final String PATCH_REVISION = "r24";
+    public static final String PATCH_REVISION = "r25";
 
     /** Rewritten {@code expectedWidth} for the retail widescreen branch. */
     private static final int EXPECTED_WIDTH_FROM = 368;
@@ -360,6 +373,13 @@ public final class GameJarPatcher {
     private static final int GLES2_DONT_CARE_HINT = 0x1100;
     /** GL_DEBUG_TYPE_PERFORMANCE -- Adreno's "Namespace collision" hint. */
     private static final int GL_DEBUG_TYPE_PERFORMANCE = 0x8250;
+    /** GL_DEBUG_TYPE_OTHER -- Adreno also tags the hint as [Other]. */
+    private static final int GL_DEBUG_TYPE_OTHER = 0x8251;
+    /**
+     * The ID Adreno reports for messages that carry no KHR_debug ID
+     * ({@code Integer.MAX_VALUE}). The namespace-collision hint uses it.
+     */
+    private static final int ADRENO_NO_MESSAGE_ID = 0x7FFFFFFF;
     /** JVM type code for {@code int[]} (NEWARRAY operand). */
     private static final int T_INT = 10;
 
@@ -577,7 +597,8 @@ public final class GameJarPatcher {
                 GL_TRIANGLE_STRIP, GL_TRIANGLES_VERTS,
                 GL_TRIANGLES_ADJACENCY_VERTS, GL_TRIANGLE_STRIP_MIN,
                 GLES_DONT_CARE_KHR, GLES2_DONT_CARE_HINT,
-                GL_DEBUG_TYPE_PERFORMANCE,
+                GL_DEBUG_TYPE_PERFORMANCE, GL_DEBUG_TYPE_OTHER,
+                ADRENO_NO_MESSAGE_ID,
                 // The GL-popup mute is a patch *shape* change (a new synthetic
                 // method plus a redirect), not just a constant tweak, so it
                 // belongs in the stamp as well as in PATCH_REVISION.
@@ -1258,7 +1279,28 @@ public final class GameJarPatcher {
                 }
 
                 return new MethodVisitor(Opcodes.ASM9, mv) {
-                    private boolean performanceMuted;
+                    private final int idLocal = (access & Opcodes.ACC_STATIC) == 0 ? 3 : 2;
+
+                    @Override
+                    public void visitCode() {
+                        super.visitCode();
+                        if (isCallback) {
+                            // Belt-and-braces for drivers that ignore the
+                            // type/ID filter below: the Adreno performance
+                            // hint carries the 0x7FFFFFFF "no ID" sentinel.
+                            // Dropping it at the callback's first instruction
+                            // avoids the six glGetObjectLabel queries, the
+                            // eight log lines, the Throwable and the popup,
+                            // all of which run synchronously inside the GL
+                            // call that raised the message.
+                            final Label notNoId = new Label();
+                            super.visitVarInsn(Opcodes.ILOAD, this.idLocal);
+                            super.visitLdcInsn(Integer.valueOf(ADRENO_NO_MESSAGE_ID));
+                            super.visitJumpInsn(Opcodes.IF_ICMPNE, notNoId);
+                            super.visitInsn(Opcodes.RETURN);
+                            super.visitLabel(notNoId);
+                        }
+                    }
 
                     @Override
                     public void visitIntInsn(final int opcode, final int operand) {
@@ -1278,28 +1320,15 @@ public final class GameJarPatcher {
                                                 final String methodDescriptor, final boolean itf) {
                         if (opcode == Opcodes.INVOKESTATIC
                                 && GLES32_OWNER.equals(owner)
-                                && "glDebugMessageControl".equals(methodName)
-                                && "(III[IZ)V".equals(methodDescriptor)) {
-                            super.visitMethodInsn(opcode, owner, methodName, methodDescriptor, itf);
-                            if (!performanceMuted) {
-                                // The operand stack is empty again here, so
-                                // the extra filter can be pushed safely.
-                                // Mute the driver's PERFORMANCE messages
-                                // ("Namespace collision detected, using slow
-                                // path"). The severity filters the game sets
-                                // afterwards do not touch the type filter, so
-                                // doing it once is enough.
-                                performanceMuted = true;
-                                super.visitLdcInsn(Integer.valueOf(GLES_DONT_CARE_KHR));
-                                super.visitLdcInsn(Integer.valueOf(GL_DEBUG_TYPE_PERFORMANCE));
-                                super.visitLdcInsn(Integer.valueOf(GLES_DONT_CARE_KHR));
-                                super.visitInsn(Opcodes.ICONST_0);
-                                super.visitIntInsn(Opcodes.NEWARRAY, T_INT);
-                                super.visitInsn(Opcodes.ICONST_0);
-                                super.visitMethodInsn(Opcodes.INVOKESTATIC, GLES32_OWNER,
-                                        "glDebugMessageControl", "(III[IZ)V", false);
-                            }
-                            return;
+                                && "glDebugMessageCallback".equals(methodName)
+                                && "(Lorg/lwjgl/opengles/GLDebugMessageCallbackI;J)V".equals(methodDescriptor)) {
+                            // Apply the mutes *after* the game's last filter
+                            // call. KHR_debug's last matching rule wins, and
+                            // the game enables every HIGH-severity message
+                            // right before installing the callback -- which
+                            // is what silently undid the r24 mute (it was
+                            // inserted after the first filter instead).
+                            emitGlDebugMutes(mv);
                         }
 
                         if (isCallback
@@ -1331,6 +1360,47 @@ public final class GameJarPatcher {
 
         reader.accept(visitor, 0);
         return writer.toByteArray();
+    }
+
+    /**
+     * Emit the KHR_debug filters that silence Adreno's benign performance
+     * hints. Must run after the game's final {@code glDebugMessageControl}
+     * call: KHR_debug applies the <b>last</b> matching rule, and the game's
+     * "enable every HIGH severity message" call comes last.
+     *
+     * <p>Three filters are emitted: PERFORMANCE and OTHER by type (Adreno has
+     * tagged the namespace-collision hint as both at different driver
+     * versions), and the 0x7FFFFFFF no-ID sentinel by ID. The ID filter is
+     * also mirrored inside the callback, in case a driver ignores it.
+     */
+    private static void emitGlDebugMutes(final MethodVisitor mv) {
+        emitTypeMute(mv, GL_DEBUG_TYPE_PERFORMANCE);
+        emitTypeMute(mv, GL_DEBUG_TYPE_OTHER);
+
+        mv.visitLdcInsn(Integer.valueOf(GLES_DONT_CARE_KHR));
+        mv.visitLdcInsn(Integer.valueOf(GLES_DONT_CARE_KHR));
+        mv.visitLdcInsn(Integer.valueOf(GLES_DONT_CARE_KHR));
+        mv.visitInsn(Opcodes.ICONST_1);
+        mv.visitIntInsn(Opcodes.NEWARRAY, T_INT);
+        mv.visitInsn(Opcodes.DUP);
+        mv.visitInsn(Opcodes.ICONST_0);
+        mv.visitLdcInsn(Integer.valueOf(ADRENO_NO_MESSAGE_ID));
+        mv.visitInsn(Opcodes.IASTORE);
+        mv.visitInsn(Opcodes.ICONST_0);
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, GLES32_OWNER,
+                "glDebugMessageControl", "(III[IZ)V", false);
+    }
+
+    /** {@code glDebugMessageControl(DONT_CARE, type, DONT_CARE, {}, false)}. */
+    private static void emitTypeMute(final MethodVisitor mv, final int type) {
+        mv.visitLdcInsn(Integer.valueOf(GLES_DONT_CARE_KHR));
+        mv.visitLdcInsn(Integer.valueOf(type));
+        mv.visitLdcInsn(Integer.valueOf(GLES_DONT_CARE_KHR));
+        mv.visitInsn(Opcodes.ICONST_0);
+        mv.visitIntInsn(Opcodes.NEWARRAY, T_INT);
+        mv.visitInsn(Opcodes.ICONST_0);
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, GLES32_OWNER,
+                "glDebugMessageControl", "(III[IZ)V", false);
     }
 
     /**
