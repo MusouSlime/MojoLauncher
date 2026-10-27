@@ -54,8 +54,8 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
      *  mobile-controls mod is used instead. */
     private com.severedchains.launcher.ui.TouchGamepadView mTouchPad;
     private android.widget.EditText keyboardInput;
-    private android.widget.Button keyboardButton;
-    private android.widget.Button exitButton;
+    private android.widget.ImageButton keyboardButton;
+    private android.widget.ImageButton exitButton;
     private android.widget.ImageButton eyeButton;
     /** True when the on-screen controls are hidden via the eye toggle. */
     private boolean mOverlayHidden = false;
@@ -68,6 +68,8 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
     // and a single BACK returns to the launcher immediately.
     private static final String PREFS_PAD = "sclauncher_prefs";
     private boolean mHandheldMode = false;
+    /** On-screen keyboard button + auto-raise (launcher Options → Layout). */
+    private boolean mKeyboardEnabled = true;
 
     // Touch is always forwarded to SDL as a mouse (motion + left button),
     // which is what the in-game mobile-controls mod's window hooks expect.
@@ -85,7 +87,8 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
         @Override
         public void run() {
             try {
-                final boolean active = SCSdlNative.isLoaded() && SCSdlNative.isTextInputActive();
+                final boolean active = mKeyboardEnabled
+                        && SCSdlNative.isLoaded() && SCSdlNative.isTextInputActive();
                 if (active != mAutoKeyboardActive) {
                     mAutoKeyboardActive = active;
                     if (active) {
@@ -108,6 +111,15 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
                     .getBoolean(SCLauncherActivity.PREF_HANDHELD, false);
         } catch (Exception ignored) {
             mHandheldMode = false;
+        }
+    }
+
+    private void loadKeyboardPref() {
+        try {
+            mKeyboardEnabled = getSharedPreferences(PREFS_PAD, MODE_PRIVATE)
+                    .getBoolean(SCLauncherActivity.PREF_KEYBOARD_ENABLED, true);
+        } catch (Exception ignored) {
+            mKeyboardEnabled = true;
         }
     }
 
@@ -275,8 +287,12 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
         // SDL_TextInputActive() (the game calls SDL_StartTextInput when a text
         // field is focused) and shows/hides the keyboard accordingly.
         loadHandheldPref();
+        loadKeyboardPref();
         if (exitButton != null) {
             exitButton.setVisibility(mHandheldMode ? View.GONE : View.VISIBLE);
+        }
+        if (keyboardButton != null) {
+            keyboardButton.setVisibility(mKeyboardEnabled ? View.VISIBLE : View.GONE);
         }
         SCLogger.appendToLog("input mode -> MOUSE" + (mHandheldMode ? " (handheld)" : ""));
         keyboardHandler.post(mKeyboardPoll);
@@ -1089,7 +1105,15 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
         });
     }
 
+    /** How many delayed retries a keyboard-show request makes while the
+     *  immersive transition / focus change settles. */
+    private static final int KEYBOARD_SHOW_RETRIES = 8;
+
     private void showGameKeyboard() {
+        if (!mKeyboardEnabled) {
+            SCLogger.appendToLog("kb: disabled in launcher options");
+            return;
+        }
         if (keyboardInput == null) {
             SCLogger.appendToLog("kb: hidden input view missing");
             return;
@@ -1098,30 +1122,60 @@ public class SCGameActivity extends AppCompatActivity implements SurfaceHolder.C
         try {
             keyboardInput.setFocusable(true);
             keyboardInput.setFocusableInTouchMode(true);
+            // Re-focus even if a pad/surface touch stole focus. requestFocus()
+            // is a no-op when the view already has focus, so always call it
+            // before restarting the input connection.
             keyboardInput.requestFocus();
+            keyboardInput.setSelection(keyboardInput.getText().length());
             final InputMethodManager imm = (InputMethodManager)
                     getSystemService(android.content.Context.INPUT_METHOD_SERVICE);
-            if (imm == null) return;
-            // A show request issued in the same frame as the focus change (and
-            // while the immersive/system bars are still settling) is routinely
-            // ignored, so post it to the next frame and force it if the normal
-            // path declines.
-            keyboardInput.post(() -> {
-                try {
-                    imm.restartInput(keyboardInput);
-                    final boolean shown = imm.showSoftInput(keyboardInput,
-                            InputMethodManager.SHOW_IMPLICIT);
-                    SCLogger.appendToLog("kb: showSoftInput -> " + shown);
-                    if (!shown) {
-                        imm.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0);
-                        SCLogger.appendToLog("kb: toggled SHOW_FORCED");
-                    }
-                } catch (Throwable t) {
-                    Log.w(TAG, "show keyboard failed", t);
-                }
-            });
+            if (imm == null) {
+                SCLogger.appendToLog("kb: no InputMethodManager");
+                return;
+            }
+            // The first request is usually ignored while the window is still
+            // settling into immersive mode or while focus is moving to the
+            // hidden view, so retry on the next frames until the IME accepts.
+            keyboardInput.postDelayed(() -> attemptShowKeyboard(imm, 0), 50);
         } catch (Exception e) {
             Log.w(TAG, "show keyboard failed", e);
+        }
+    }
+
+    private void attemptShowKeyboard(InputMethodManager imm, int attempt) {
+        if (keyboardInput == null || isFinishing()
+                || !keyboardInput.isAttachedToWindow()) {
+            return;
+        }
+        try {
+            if (!keyboardInput.hasFocus()) {
+                keyboardInput.setFocusable(true);
+                keyboardInput.setFocusableInTouchMode(true);
+                keyboardInput.requestFocus();
+            }
+            keyboardInput.setSelection(keyboardInput.getText().length());
+            imm.restartInput(keyboardInput);
+            boolean shown = imm.showSoftInput(keyboardInput,
+                    InputMethodManager.SHOW_IMPLICIT);
+            if (!shown) {
+                shown = imm.showSoftInput(keyboardInput, 0);
+            }
+            SCLogger.appendToLog("kb: showSoftInput attempt " + attempt
+                    + " -> " + shown);
+            if (shown) return;
+            if (attempt < KEYBOARD_SHOW_RETRIES) {
+                keyboardInput.postDelayed(
+                        () -> attemptShowKeyboard(imm, attempt + 1), 100);
+                return;
+            }
+            // Last resort: force the IME up. toggleSoftInput would hide an
+            // already-visible keyboard, so only use it when it is not up.
+            if (!imm.isActive(keyboardInput)) {
+                imm.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0);
+                SCLogger.appendToLog("kb: toggled SHOW_FORCED");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "show keyboard failed", t);
         }
     }
 

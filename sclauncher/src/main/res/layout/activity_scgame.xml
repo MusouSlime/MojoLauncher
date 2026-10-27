@@ -3,11 +3,13 @@
      The Legend of Dragoon-themed on-screen controller (TouchGamepadView) is
      added at runtime and replaces the in-game mobile-controls mod; empty-area
      touches fall through to the game as a mouse (menus/UI).
-     - keyboardButton (LEFT): summons the soft keyboard for name entry. In
-       Handheld Mode the IME is also raised automatically while the game has a
-       text field focused (SDL_TextInputActive polling).
-     - exitButton (TOP CENTER): return to the launcher. Hidden in Handheld
-       Mode, where a single BACK returns instead.
+     - keyboardButton (LEFT EDGE): transparent keyboard icon that summons the
+       soft keyboard for name entry. In Handheld Mode the IME is also raised
+       automatically while the game has a text field focused
+       (SDL_TextInputActive polling).
+     - exitButton (BOTTOM RIGHT, next to the eye): transparent back-arrow icon
+       that returns to the launcher. Hidden in Handheld Mode, where a single
+       BACK returns instead.
      Buttons are brought to front after every visibility sync so the pad and
      fullscreen surface cannot swallow their touches. -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
@@ -39,33 +41,36 @@
         android:imeOptions="actionDone"
         android:importantForAutofill="noExcludeDescendants" />
 
-    <!-- Virtual-keyboard button (name entry etc.): pinned to the LEFT edge,
-         always visible (plain "KB" text so it renders on every device). -->
-    <Button
+    <!-- Transparent keyboard icon (name entry etc.): pinned to the LEFT edge,
+         no button chrome so only the icon is visible. -->
+    <ImageButton
         android:id="@+id/keyboardButton"
-        android:layout_width="56dp"
-        android:layout_height="56dp"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
         android:layout_gravity="start|center_vertical"
         android:layout_marginStart="8dp"
         android:alpha="0.6"
-        android:text="KB"
-        android:textSize="16sp" />
+        android:background="?android:attr/selectableItemBackgroundBorderless"
+        android:contentDescription="Show keyboard"
+        android:padding="8dp"
+        android:scaleType="fitCenter"
+        android:src="@drawable/ic_keyboard" />
 
-    <!-- Return to the launcher. Bottom-right corner, next to the eye toggle.
+    <!-- Return to the launcher. Bottom-right, next to the eye toggle.
          Hidden in Handheld Mode (single BACK exits). -->
-    <Button
+    <ImageButton
         android:id="@+id/exitButton"
-        android:layout_width="wrap_content"
+        android:layout_width="40dp"
         android:layout_height="40dp"
         android:layout_gravity="bottom|end"
-        android:layout_marginEnd="8dp"
+        android:layout_marginEnd="56dp"
         android:layout_marginBottom="12dp"
         android:alpha="0.6"
-        android:minWidth="72dp"
-        android:paddingStart="12dp"
-        android:paddingEnd="12dp"
-        android:text="Exit"
-        android:textSize="14sp" />
+        android:background="?android:attr/selectableItemBackgroundBorderless"
+        android:contentDescription="Back to launcher"
+        android:padding="8dp"
+        android:scaleType="fitCenter"
+        android:src="@drawable/ic_arrow_back" />
 
     <!-- Hide/show the on-screen controls (handheld: clear the screen to watch
          the game). Always visible so the controls can be brought back. -->
@@ -74,7 +79,7 @@
         android:layout_width="40dp"
         android:layout_height="40dp"
         android:layout_gravity="bottom|end"
-        android:layout_marginEnd="88dp"
+        android:layout_marginEnd="8dp"
         android:layout_marginBottom="12dp"
         android:alpha="0.6"
         android:background="?android:attr/selectableItemBackgroundBorderless"

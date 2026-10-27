@@ -16,11 +16,14 @@ import android.os.Looper;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.util.Log;
+import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
-import android.widget.PopupMenu;
+import android.widget.CheckBox;
+import android.widget.HorizontalScrollView;
+import android.widget.LinearLayout;
 import android.widget.ProgressBar;
-import android.widget.Switch;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -182,8 +185,18 @@ public class SCLauncherActivity extends AppCompatActivity {
      * only the screen-covering popup is suppressed.
      */
     public static final String PREF_MUTE_GL_POPUPS = "mute_gl_popups";
+    /** On-screen keyboard button + auto-raise (game screen). Default ON. */
+    public static final String PREF_KEYBOARD_ENABLED = "keyboard_enabled";
     /** JVM property the launcher passes to the game for the setting above. */
     public static final String PROP_MUTE_GL_POPUPS = "sc.mute.gl.popups";
+
+    /** Options dialog categories. */
+    private static final int CAT_LAYOUT = 0;
+    private static final int CAT_MODS = 1;
+    private static final int CAT_INSTALL = 2;
+    private static final int CAT_DATA = 3;
+    private static final String[] OPTION_CATEGORIES = {
+            "Layout", "Mods", "Install", "Data"};
 
     /** Diagnostic probe: visualise the raw battle vertex position (inPos) as
      *  colour, untextured. See applyGpuShaderVariant + gpu_variants/probe/. */
@@ -297,7 +310,7 @@ public class SCLauncherActivity extends AppCompatActivity {
         launchButton = findViewById(R.id.launchButton);
         menuButton = findViewById(R.id.menuButton);
         if (menuButton != null) {
-            menuButton.setOnClickListener(v -> showOptionsMenu());
+            menuButton.setOnClickListener(v -> showOptionsDialog());
         }
         gpuModeText = findViewById(R.id.gpuModeText);
 
@@ -1084,108 +1097,228 @@ public class SCLauncherActivity extends AppCompatActivity {
     }
 
     // ------------------------------------------------------------------
-    // Options dropdown: every launcher action except Launch lives here,
-    // rebuilt fresh on each open so disc ✓ states and the JRE-download
-    // entry are always current.
+    // Options dialog: category tabs (Layout / Mods / Install / Data) with
+    // the actions split into them. Switch-style settings use checkboxes.
+    // Rebuilt on each open so disc/JRE state is always current.
     // ------------------------------------------------------------------
-    private void showOptionsMenu() {
+    private void showOptionsDialog() {
         if (menuButton == null) return;
-        PopupMenu menu = new PopupMenu(this, menuButton);
-        int order = 0;
-        menu.getMenu().add(0, 1, order++, "Search Again");
-        menu.getMenu().add(0, 2, order++, "Import Unpacked Data (files/)…");
-        menu.getMenu().add(0, 3, order++, "Send Log");
-        if (foundJreName == null) {
-            menu.getMenu().add(0, 4, order++, "Download JRE 25");
+
+        final LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundResource(R.drawable.lod_panel);
+        int pad = dp(16);
+        root.setPadding(pad, pad, pad, dp(8));
+
+        TextView heading = new TextView(this);
+        heading.setText("Options");
+        heading.setTextSize(20);
+        heading.setTextColor(ContextCompat.getColor(this, R.color.lod_gold));
+        heading.setTypeface(null, android.graphics.Typeface.BOLD);
+        root.addView(heading);
+
+        final HorizontalScrollView tabsScroll = new HorizontalScrollView(this);
+        tabsScroll.setHorizontalScrollBarEnabled(false);
+        final LinearLayout tabs = new LinearLayout(this);
+        tabs.setOrientation(LinearLayout.HORIZONTAL);
+        tabs.setPadding(0, dp(10), 0, dp(10));
+        tabsScroll.addView(tabs);
+        root.addView(tabsScroll, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        final ScrollView scroll = new ScrollView(this);
+        final LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        scroll.addView(content);
+        int scrollHeight = (int) (getResources().getDisplayMetrics().heightPixels * 0.58f);
+        root.addView(scroll, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, scrollHeight));
+
+        final AlertDialog dialog = new AlertDialog.Builder(this)
+                .setView(root)
+                .setNegativeButton("Close", null)
+                .create();
+
+        final Button[] tabButtons = new Button[OPTION_CATEGORIES.length];
+        for (int i = 0; i < OPTION_CATEGORIES.length; i++) {
+            final int category = i;
+            Button tab = new Button(this);
+            tab.setText(OPTION_CATEGORIES[i]);
+            tab.setAllCaps(false);
+            tab.setTextSize(14);
+            tab.setMinWidth(0);
+            tab.setMinimumWidth(0);
+            tab.setPadding(dp(14), dp(8), dp(14), dp(8));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
+            lp.setMargins(0, 0, dp(6), 0);
+            tab.setLayoutParams(lp);
+            tab.setOnClickListener(v -> {
+                for (int j = 0; j < tabButtons.length; j++) {
+                    styleOptionTab(tabButtons[j], j == category);
+                }
+                populateOptionsCategory(content, dialog, category);
+            });
+            tabButtons[i] = tab;
+            tabs.addView(tab);
         }
-        menu.getMenu().add(0, 5, order++, "Import JRE…");
-        menu.getMenu().add(0, 6, order++, "Disc Status…");
-        menu.getMenu().add(0, 7, order++, "Update Game…");
-        for (int i = 0; i < DISC_FILE_PATTERNS.length; i++) {
-            menu.getMenu().add(0, 10 + i, order++, discLabel(i));
-        }
-        menu.getMenu().add(0, 20, order++, "Export Saves");
-        menu.getMenu().add(0, 21, order++, "Import Saves");
-        menu.getMenu().add(0, 30, order++, "Import Mod Jar…");
-        menu.getMenu().add(0, 35, order++, "Import Mod Zip…");
-        menu.getMenu().add(0, 34, order++, "Import Mod Folder…");
-        menu.getMenu().add(0, 32, order++, "Mod Manager…");
-        menu.getMenu().add(0, 31, order++, "App Folder (mods)…");
-        menu.getMenu().add(0, 40, order++, loadHandheldMode() ? "Handheld Mode ✓" : "Handheld Mode");
-        menu.getMenu().add(0, 41, order++, loadTouchPad() ? "Dragoon Pad ✓" : "Dragoon Pad");
-        menu.getMenu().add(0, 42, order++, "Touch Pad Opacity…");
-        menu.getMenu().add(0, 43, order++, "Reset Controls");
-        menu.getMenu().add(0, 44, order++, loadMuteGlPopups()
-                ? "Mute In-Game Error Popups ✓"
-                : "Mute In-Game Error Popups");
-        menu.setOnMenuItemClickListener(item -> {
-            int id = item.getItemId();
-            if (id == 1) {
-                refreshAll();
-                return true;
-            } else if (id == 2) {
-                mPickUnpackedLauncher.launch(null);
-                return true;
-            } else if (id == 3) {
-                sendLastLog();
-                return true;
-            } else if (id == 4) {
-                downloadJre25();
-                return true;
-            } else if (id == 5) {
-                importJreFromStorage();
-                return true;
-            } else if (id == 6) {
-                showDiscStatusDialog();
-                return true;
-            } else if (id == 7) {
-                updateGame();
-                return true;
-            } else if (id >= 10 && id < 14) {
-                pickDiscImage(id - 10);
-                return true;
-            } else if (id == 20) {
-                exportSaves();
-                return true;
-            } else if (id == 21) {
-                pickSavesArchive();
-                return true;
-            } else if (id == 30) {
-                mImportModJarLauncher.launch("*/*");
-                return true;
-            } else if (id == 35) {
-                mImportModZipLauncher.launch(new String[]{
-                        "application/zip", "application/x-zip-compressed", "application/octet-stream"});
-                return true;
-            } else if (id == 34) {
-                mImportModsFolderLauncher.launch(null);
-                return true;
-            } else if (id == 31) {
-                showAppFolderDialog();
-                return true;
-            } else if (id == 32) {
-                showModManagerDialog();
-                return true;
-            } else if (id == 40) {
-                setHandheldMode(!loadHandheldMode());
-                return true;
-            } else if (id == 41) {
-                setTouchPad(!loadTouchPad());
-                return true;
-            } else if (id == 42) {
-                chooseTouchPadOpacity();
-                return true;
-            } else if (id == 43) {
-                resetControls();
-                return true;
-            } else if (id == 44) {
-                setMuteGlPopups(!loadMuteGlPopups());
-                return true;
+        styleOptionTab(tabButtons[CAT_LAYOUT], true);
+        populateOptionsCategory(content, dialog, CAT_LAYOUT);
+
+        dialog.setOnShowListener(d -> {
+            if (dialog.getWindow() != null) {
+                dialog.getWindow().setBackgroundDrawableResource(
+                        android.R.color.transparent);
             }
-            return false;
         });
-        menu.show();
-        SCActionTrail.record("Options menu opened");
+        dialog.show();
+        SCActionTrail.record("Options dialog opened");
+    }
+
+    private void styleOptionTab(Button tab, boolean active) {
+        if (tab == null) return;
+        tab.setBackgroundResource(active
+                ? R.drawable.lod_button_primary : R.drawable.lod_button);
+        tab.setTextColor(ContextCompat.getColor(this,
+                active ? R.color.lod_button_text : R.color.lod_cream));
+    }
+
+    /** Fill the dialog body for one category. */
+    private void populateOptionsCategory(LinearLayout content,
+                                         AlertDialog dialog, int category) {
+        content.removeAllViews();
+        switch (category) {
+            case CAT_LAYOUT:
+                addOptionHeading(content, "Display & Controls");
+                addOptionToggle(content, "Handheld Mode", loadHandheldMode(),
+                        (buttonView, checked) -> setHandheldMode(checked));
+                addOptionToggle(content, "Dragoon Pad", loadTouchPad(),
+                        (buttonView, checked) -> setTouchPad(checked));
+                addOptionToggle(content, "On-screen Keyboard", loadKeyboardEnabled(),
+                        (buttonView, checked) -> setKeyboardEnabled(checked));
+                addOptionToggle(content, "Mute In-Game Error Popups",
+                        loadMuteGlPopups(),
+                        (buttonView, checked) -> setMuteGlPopups(checked));
+                addOptionAction(content, dialog, "Touch Pad Opacity…",
+                        this::chooseTouchPadOpacity);
+                addOptionAction(content, dialog, "Reset Controls",
+                        this::resetControls);
+                break;
+
+            case CAT_MODS:
+                addOptionHeading(content, "Mods");
+                addOptionAction(content, dialog, "Import Mod Jar…",
+                        () -> mImportModJarLauncher.launch("*/*"));
+                addOptionAction(content, dialog, "Import Mod Zip…",
+                        () -> mImportModZipLauncher.launch(new String[]{
+                                "application/zip", "application/x-zip-compressed",
+                                "application/octet-stream"}));
+                addOptionAction(content, dialog, "Import Mod Folder…",
+                        () -> mImportModsFolderLauncher.launch(null));
+                addOptionAction(content, dialog, "Mod Manager…",
+                        this::showModManagerDialog);
+                addOptionAction(content, dialog, "App Folder (mods)…",
+                        this::showAppFolderDialog);
+                break;
+
+            case CAT_INSTALL:
+                addOptionHeading(content, "Game & Runtime");
+                addOptionAction(content, dialog, "Search Again",
+                        this::refreshAll);
+                addOptionAction(content, dialog, "Import Unpacked Data (files/)…",
+                        () -> mPickUnpackedLauncher.launch(null));
+                if (foundJreName == null) {
+                    addOptionAction(content, dialog, "Download JRE 25",
+                            this::downloadJre25);
+                } else {
+                    addOptionInfo(content, "JRE: " + foundJreName);
+                }
+                addOptionAction(content, dialog, "Import JRE…",
+                        this::importJreFromStorage);
+                addOptionAction(content, dialog, "Update Game…",
+                        this::updateGame);
+                addOptionAction(content, dialog, "Disc Status…",
+                        this::showDiscStatusDialog);
+                addOptionHeading(content, "Disc Images");
+                for (int i = 0; i < DISC_FILE_PATTERNS.length; i++) {
+                    final int index = i;
+                    addOptionAction(content, dialog, discLabel(index),
+                            () -> pickDiscImage(index));
+                }
+                break;
+
+            case CAT_DATA:
+                addOptionHeading(content, "Saves");
+                addOptionAction(content, dialog, "Export Saves",
+                        this::exportSaves);
+                addOptionAction(content, dialog, "Import Saves",
+                        this::pickSavesArchive);
+                addOptionHeading(content, "Diagnostics");
+                addOptionAction(content, dialog, "Send Log",
+                        this::sendLastLog);
+                break;
+        }
+    }
+
+    private void addOptionHeading(LinearLayout parent, String text) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextSize(13);
+        tv.setTextColor(ContextCompat.getColor(this, R.color.lod_dim));
+        tv.setPadding(0, dp(12), 0, dp(4));
+        parent.addView(tv);
+    }
+
+    private void addOptionInfo(LinearLayout parent, String text) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextSize(14);
+        tv.setTextColor(ContextCompat.getColor(this, R.color.lod_cream));
+        tv.setPadding(0, dp(6), 0, dp(6));
+        parent.addView(tv);
+    }
+
+    private void addOptionToggle(LinearLayout parent, String label,
+                                 boolean checked,
+                                 android.widget.CompoundButton.OnCheckedChangeListener listener) {
+        CheckBox cb = new CheckBox(this);
+        cb.setText(label);
+        cb.setTextSize(16);
+        cb.setTextColor(ContextCompat.getColor(this, R.color.lod_cream));
+        cb.setChecked(checked);
+        cb.setPadding(0, dp(6), 0, dp(6));
+        cb.setOnCheckedChangeListener(listener);
+        parent.addView(cb, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+    }
+
+    private void addOptionAction(LinearLayout parent, AlertDialog dialog,
+                                 String label, Runnable action) {
+        Button button = new Button(this);
+        button.setText(label);
+        button.setAllCaps(false);
+        button.setTextSize(15);
+        button.setTextColor(ContextCompat.getColor(this, R.color.lod_cream));
+        button.setBackgroundResource(R.drawable.lod_button);
+        button.setGravity(Gravity.CENTER_VERTICAL | Gravity.START);
+        button.setPadding(dp(16), dp(8), dp(16), dp(8));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, dp(4), 0, 0);
+        button.setLayoutParams(lp);
+        button.setOnClickListener(v -> {
+            if (dialog != null && dialog.isShowing()) dialog.dismiss();
+            action.run();
+        });
+        parent.addView(button);
+    }
+
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
     /** Persisted Handheld Mode setting (read by SCGameActivity at launch). */
@@ -1196,6 +1329,31 @@ public class SCLauncherActivity extends AppCompatActivity {
         } catch (Exception ignored) {
             return false;
         }
+    }
+
+    /** Persisted on-screen keyboard setting (read by SCGameActivity). */
+    public boolean loadKeyboardEnabled() {
+        try {
+            return getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getBoolean(PREF_KEYBOARD_ENABLED, true);
+        } catch (Exception ignored) {
+            return true;
+        }
+    }
+
+    private void setKeyboardEnabled(final boolean enabled) {
+        try {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit().putBoolean(PREF_KEYBOARD_ENABLED, enabled).apply();
+        } catch (Exception ignored) {}
+        final String label = enabled
+                ? "On-screen keyboard ON"
+                : "On-screen keyboard OFF";
+        try {
+            android.widget.Toast.makeText(this, label, android.widget.Toast.LENGTH_SHORT).show();
+        } catch (Exception ignored) {}
+        LogFile.log(label);
+        SCActionTrail.record(label);
     }
 
     private void setHandheldMode(final boolean enabled) {
